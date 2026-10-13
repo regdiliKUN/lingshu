@@ -413,10 +413,18 @@ def _gate_audit(ctx):
         tags = a.get("tags")
         if isinstance(tags, (list, tuple)):
             tags = [audit.redact_forbidden(t) if isinstance(t, str) else t for t in tags]
+        # issue #214：调用方**声明的密级**必须原样透传——与同函数的 DEFER 出口
+        # （:423-427，#186 已修）和 ACCEPT 落盘面（:766-773，B2 已修）同口径。
+        # 此前不传 ⇒ MdCGSecure.add_rejected 取 DEFAULT_SENSITIVITY=internal，
+        # 声明 private 的正文前 200 字以**明文**写进 rejected/rej_*.md，无令牌
+        # 访客经 stg(op=timeline) / cg(op=read, node_id) / mdcg_get 三处可读；
+        # 回执还写着「本条未入库」，写入方不会察觉。
+        # 未声明（None）时行为不变：仍按 internal（#87 已裁的缺省）。
         rid = cg.add_rejected(audit.redact_forbidden(a.get("content") or "")[:200],
                               verdict["evidence"],
                               verification_basis=verdict.get("basis") or "test",
-                              tags=tags)
+                              tags=tags,
+                              sensitivity=a.get("sensitivity"))
         return {"ok": False, "id": rid, "committed": False,
                 "moved_to": "rejected", "verdict": verdict,
                 "hint": _reject_hint(verdict)}
@@ -771,6 +779,14 @@ def _executor(ctx):
            # （纯漏传，非设计取舍）。透传即修好，**不得**在此自行 _seal_content
            # （会绕过 fm 与 _write_node 的单一密封点）。
            sensitivity=a.get("sensitivity"),
+           # issue #186 补完（显式声明优先，与 propose 单点同口径）：mdcos.propose
+           # 的单点写的是 `_eff_session = (kw.get("session") or
+           # _attribution_session_of(self, kw.get("sensitivity")))` —— 显式声明优先；
+           # 而本实参表此前**漏传 session**，add 内的单点只能回落归因哈希。于是
+           # 同一份显式声明在「直连」与「入队→accept」两条路上落成两个不同的
+           # fm.session（漏传族又一次发作）。透传即修好；**不得**在此自行推 session
+           # （会绕过 add 的单点，制造第二套口径）。
+           session=a.get("session"),
            layer=a.get("layer") or "knowledge",
            tags=a.get("tags"), condition_space=a.get("condition_space"),
            importance=0.5 if _imp is None else float(_imp),

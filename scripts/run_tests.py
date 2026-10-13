@@ -81,7 +81,7 @@ def _discovered_files():
     """
     import glob
     files = []
-    files += sorted(glob.glob(os.path.join(_REPO, "md_cg", "test_*.py")))
+    files += sorted(glob.glob(os.path.join(_REPO, "md_cg", "**", "test_*.py"), recursive=True))
     for pkg in ("compiler", "swarm"):
         for f in sorted(glob.glob(os.path.join(_REPO, pkg, "tests", "*.py"))):
             if os.path.basename(f).startswith("_"):
@@ -95,6 +95,17 @@ def _discovered_files():
     return [os.path.relpath(f, _REPO).replace("\\", "/") for f in files]
 
 
+# 生效条件：独立递归盘点 _REPO/md_cg 下所有 test_*.py（basename 以 "_" 开头者跳过；`test_` 前缀天然不以 "_" 开头），返回文件数——供 --list 打印「已发现 / 磁盘递归」差额，与 _discovered_files() 的收集面互为独立核算（issue #185）。
+def _md_cg_disk_recursive_count():
+    """磁盘上 md_cg/ 递归可见的测试文件数（独立于 _discovered_files 的核算口径）。"""
+    n = 0
+    for _dp, _dn, fs in os.walk(os.path.join(_REPO, "md_cg")):
+        for fn in fs:
+            if fn.startswith("test_") and fn.endswith(".py"):
+                n += 1
+    return n
+
+
 # 生效条件：基于 _discovered_files() 的文件列表按目录前缀分派命令形态（md_cg/ 与 hive/ 是包 -m 优先、compiler|swarm/tests/ 双候选、scripts/ 非包只直跑），返回 (组名, 显示名, argv 候选列表) 列表。
 def _discover():
     """返回 [(组名, 显示名, argv)]；argv 为候选列表（依次尝试直到成功启动）。"""
@@ -104,8 +115,12 @@ def _discover():
         parts = rel.split("/")
         stem = os.path.splitext(parts[-1])[0]
         if rel.startswith("md_cg/"):
-            out.append(("md_cg", f"md_cg.{stem}",
-                        [[sys.executable, "-X", "utf8", "-m", f"md_cg.{stem}"]]))
+            # 模块名按**仓库根相对路径**推导（issue #185）：md_cg/sub/test_x.py →
+            # md_cg.sub.test_x；顶层 md_cg/test_x.py 仍是 md_cg.test_x（逐位不变）。
+            # 子目录测试不再被压成扁平 stem——那会与兄弟撞名并静默消失。
+            _mod = "md_cg." + rel[len("md_cg/"):-3].replace("/", ".")
+            out.append(("md_cg", _mod,
+                        [[sys.executable, "-X", "utf8", "-m", _mod]]))
         elif rel.startswith(("compiler/", "swarm/")):
             pkg = parts[0]
             out.append((pkg, f"{pkg}.tests.{stem}",
@@ -133,7 +148,8 @@ def _discover():
 
 # 生效条件：给定 name、候选命令列表 argvs、超时秒数 timeout（parallel=True 时向子进程
 # 加传 MDCG_RUN_TESTS_PARALLEL=1 的并行信号），逐个 subprocess.run（cwd 为模块级常量
-# _REPO，env 在 os.environ 基础上覆盖 PYTHONUTF8=1/PYTHONIOENCODING=utf-8，shell=False，
+# _REPO，env 由 _child_env(parallel) 构造（os.environ 基底 + PYTHONUTF8=1 /
+# PYTHONIOENCODING=utf-8，并剔除 _SESSION_ENV_STRIP 中的会话类键），shell=False，
 # encoding="utf-8"/errors="replace"）：抛 TimeoutExpired 即返回 (name, False,
 # f"超时（>{timeout}s）")；若 returncode!=0 且 stderr 含 "No module named" 且
 # len(argvs)>1 则记下该 stderr 末 300 字符继续下一候选，否则返回 (name,
@@ -143,9 +159,7 @@ def _run_one(name, argvs, timeout, parallel=False):
     # parallel（2026-10-03 外部报告核验新增）：负载敏感的性能断言（见
     # md_cg/test_index_crossprocess_reload ⑥）据此在并行下明示豁免、串行照测——
     # 语义断言不受影响，覆盖不丢（对比 _SERIAL_ONLY 的整测试跳过——那个教训在集合注释里）。
-    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
-    if parallel:
-        env["MDCG_RUN_TESTS_PARALLEL"] = "1"
+    env = _child_env(parallel)
     last = ""
     for argv in argvs:                    # -m 优先；No module named 时回退直跑
         try:
@@ -162,13 +176,29 @@ def _run_one(name, argvs, timeout, parallel=False):
     return name, False, last
 
 
-# 生效条件：当模块级常量 _REPO 下 md_cg/whitebox_kb/wisdom/wisdom-book-cloud.db 存在时返回 None，不存在时返回依赖缺失说明字符串；
+# 生效条件：当模块级常量 _REPO 下 md_cg/whitebox_kb/wisdom/wisdom-book-cloud.db 存在、可读且 nodes 表有行时返回 None，否则返回依赖缺失/空壳说明字符串；
 def _dep_db():
     p = os.path.join(_REPO, "md_cg", "whitebox_kb", "wisdom",
                      "wisdom-book-cloud.db")
-    return (None if os.path.exists(p)
-            else "依赖白箱库 whitebox_kb/wisdom/wisdom-book-cloud.db"
-                 "（.gitignore 忽略，需本地生成）")
+    if not os.path.exists(p):
+        return ("依赖白箱库 whitebox_kb/wisdom/wisdom-book-cloud.db"
+                "（.gitignore 忽略，需本地生成）")
+    # **空壳不算就绪**（与 _dep_mdroot 同口径，2026-10-13）：兄弟测试一旦建过库
+    # 就留下 0 行的空 db，只判 exists 会把「本该 SKIP」的目标变成 FAIL，且失败
+    # 形态随机（取决于谁先跑）。判据 = nodes 表有行；读不动一律按未就绪。
+    try:
+        import sqlite3
+        c = sqlite3.connect("file:%s?mode=ro" % p.replace("\\", "/"), uri=True)
+        try:
+            n = c.execute("select count(*) from nodes").fetchone()[0]
+        finally:
+            c.close()
+    except Exception:                                    # noqa: BLE001
+        n = 0
+    if n > 0:
+        return None
+    return ("依赖白箱库 wisdom-book-cloud.db 为**空壳**（存在但 nodes 表 0 行）"
+            "——需本地生成；空壳多为兄弟测试残留，不算就绪")
 
 
 # 生效条件：当模块级常量 _REPO 下 _md_cg_wisdom_graph 为目录、且其下（递归）至少有一个 .md 文件时返回 None；目录缺失或为无 .md 的空壳目录时返回依赖缺失说明字符串；
@@ -228,6 +258,9 @@ _SKIPS = {
     "md_cg.test_p44_md_whitebox": _dep_db_and_mdroot,
     "md_cg.test_md_access_parity": _dep_db_and_mdroot,
     "md_cg.test_wisdom_md_store": _dep_mdroot,
+    # 同 `_dep_db` 口径（2026-10-13，issue #185 递归发现后暴露）：本件第 19 行
+    # 直读 `wisdom-book-cloud.db`（.gitignore 忽略，需本地生成），裸 clone 必红。
+    "md_cg.whitebox_kb.wisdom.test_navigate_self_bootstrap": _dep_db,
     "md_cg.test_imgskill": _dep_pil,
     "md_cg.test_csre_index_import_guard": _dep_numpy,
     "swarm.tests.test_swarm_fault": (
@@ -252,6 +285,28 @@ _SERIAL_ONLY = {
     # 运行」比偶发红更贵；且跳过符只作用于本层 run_tests，挡不住嵌套套件
     # （md_cg/test_interop_judgment.py:202 内层 run_tests）与手跑并发的第二实例。
 }
+
+
+# 会话类 env 剔除名单（issue #196 / #198，2026-10-13）：宿主/部署侧注入会话 id
+# （DSH_SESSION_ID / MDCG_SESSION）时，md_cg/stg.py::_view_session 的 env 权威分支
+# 会把守卫夹具声明的会话改写成 env 值，timeline(session=夹具会话) 恒 0 条——
+# 同一条守卫在「有 env 的开发机」上红、在干净 CI 上绿，属**假红**（被测代码无过）。
+# 本处统一剔除，使守卫只看被测代码；env 权威本身是 #128 的刻意设计，不属本条。
+_SESSION_ENV_STRIP = ("MDCG_SESSION", "DSH_SESSION_ID", "DSH_SESSION")
+_STRIP_UPPER = frozenset(_k.upper() for _k in _SESSION_ENV_STRIP)
+
+
+# 生效条件：parallel 为真值时在返回的 env 中加 MDCG_RUN_TESTS_PARALLEL="1"；返回的 dict
+# 以 os.environ 为基底、覆盖 PYTHONUTF8="1" 与 PYTHONIOENCODING="utf-8"，并**逐键剔除**
+# 大小写不敏感命中 _STRIP_UPPER 的键（宿主会话 env 不得进入测试子进程）；不修改 os.environ。
+def _child_env(parallel=False):
+    """构造测试子进程 env：UTF-8 约定 + 剔除宿主会话类变量（见 _SESSION_ENV_STRIP）。"""
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    for _k in [k for k in env if k.upper() in _STRIP_UPPER]:
+        env.pop(_k, None)
+    if parallel:
+        env["MDCG_RUN_TESTS_PARALLEL"] = "1"
+    return env
 
 
 # 生效条件：解析命令行（位置参数 group 为 nargs="*"、default=None，-k 默认 ""，--jobs 默认 4，--timeout 默认 900，--list 为 store_true）后，若 args.group 里有不在 ("md_cg","compiler","swarm","scripts","hive") 中的组名则 ap.error 报错退出（args.group 为 None 或空列表时该检查不触发）；groups 取 set(args.group) 或（其为假值时）全部五组；targets 由 _discover() 按 groups 过滤且 args.k 为假值或出现在显示名中；args.list 为真时打印组名与显示名及总数并返回 0；否则先按 _SKIPS 探测跳过有原因的目标，再以 max(1, args.jobs) 个线程跑 _run_one(name, a, args.timeout)，无失败打印汇总返回 0，有失败打印失败名单返回 1；
@@ -279,6 +334,11 @@ def main():
         for g, n, _a in targets:
             print(f"{g:<9}{n}")
         print(f"共 {len(targets)} 个")
+        # issue #185：让「已发现数」与「磁盘递归数」的差额可见——差额即被静默
+        # 丢弃的子目录测试数（修复后恒为 0；回退非递归 glob 时立刻 >0）。
+        _md_n = sum(1 for g, _n, _a in targets if g == "md_cg")
+        print(f"已发现 {_md_n} 个 / 磁盘递归 {_md_cg_disk_recursive_count()} 个"
+              f"（md_cg test_*.py）")
         return 0
 
     # SKIP 探测：依赖缺失/平台不符的测试不执行（外部复核建议 #3，裸 clone 友好）

@@ -120,6 +120,48 @@ def _file_digest(fp: str):
         return None
 
 
+# ---- issue #178：内容指纹按 stat 身份记忆化（把整文件读盘从检索热路径上摘掉）----
+# 键 = 节点文件绝对路径；值 = (st_mtime_ns, st_size, st_ctime_ns, digest)。
+_DIGEST_MEMO = {}
+#: 记忆表条目上界（越界即整表 clear()，避免进程内无界增长）。
+_DIGEST_MEMO_MAX = 4096
+
+
+# 生效条件：st 为真值且 (st_mtime_ns, st_size, st_ctime_ns) 与记忆中的三元组逐位相等时返回记忆的 digest（不读盘）；
+# 否则调用既有 _file_digest(fp) 重算，结果非 None 时回填（越界先 clear()）并返回；st 为 None 或 digest 为 None 时直接返回重算结果。
+def _file_digest_memo(fp: str, st):
+    """带「按 stat 身份记忆化」的内容指纹（issue #178；判据语义与 _file_digest 逐位一致）。
+
+    动机：`stale_reason` 的内容层原先**每次调用都逐节点整文件读盘 + sha256**，而它
+    落在**检索热路径**上（`MdCG.search` → `_pd.stale_reason`；实测 800 节点 116ms
+    ≈ 146µs/节点）。而每个节点在进本层之前的快路径里已确认 (mtime_ns, size) 与快照
+    逐位相等——此时内容几乎总是没变，重复读盘纯属浪费。
+
+    为什么这样不削弱 #131 的保证：命中条件是 `st_mtime_ns` / `st_size` /
+    **`st_ctime_ns`** 三项 stat 身份**逐位相等**。`st_ctime_ns` 是 **inode 状态
+    变更时间**，用户态**无法**用 `utime` / `utimensat` / `cp -p` / `rsync -t`
+    伪造——那些只还原 mtime。因此「三项 stat 身份逐位相等」等价于「文件内容自上次
+    读取以来未被改动」，缓存复用在此前提下**不可能**返回过期 digest。mtime 被还原、
+    size 不变的就地改写 ⇒ **ctime 必变** ⇒ 缓存未命中 ⇒ 重新读盘算 digest ⇒ 与
+    快照不符 ⇒ 仍判 `content_changed`。
+
+    失败不落缓存：`_file_digest` 返回 None（OSError）时不回填，避免把一次瞬时读失败
+    固化成长期结论——下次调用仍会重试读盘。
+    """
+    if st is None:
+        return _file_digest(fp)           # 无 stat 身份可记忆 ⇒ 退回无缓存路径
+    hit = _DIGEST_MEMO.get(fp)
+    if (hit is not None and hit[0] == st.st_mtime_ns
+            and hit[1] == st.st_size and hit[2] == st.st_ctime_ns):
+        return hit[3]
+    digest = _file_digest(fp)
+    if digest is not None:
+        if len(_DIGEST_MEMO) >= _DIGEST_MEMO_MAX:
+            _DIGEST_MEMO.clear()
+        _DIGEST_MEMO[fp] = (st.st_mtime_ns, st.st_size, st.st_ctime_ns, digest)
+    return digest
+
+
 # 生效条件：index_nodes 为 dict 时返回 {"nodes": 节点数, "dir_mtimes": {相对目录: mtime_ns}, "file_mtimes": {根级相对文件: mtime_ns}, "node_files": {相对路径: [mtime_ns, size, sha256 前16位]}, "index_mtime": 索引文件 mtime_ns}；
 # 假值时返回 {"nodes": 0, "dir_mtimes": {}, "file_mtimes": {}, "node_files": {}, "index_mtime": None}。
 def snapshot(root: str, index_nodes) -> dict:
@@ -146,7 +188,7 @@ def snapshot(root: str, index_nodes) -> dict:
             # 根级节点（path 无目录）不能靠「根目录 mtime」判定：我们自己写的
             # _postings.json / _postings_meta.json 就在根目录，会把根目录 mtime 改掉
             # → 快照刚建就自判过期（独立复核 2026-09-19 指出）。改为逐文件记 mtime。
-            files[p] = _mtime_ns(os.path.join(root or "", p))
+            files[p] = None          # [#154②] 由同趟 node_files 的 stat 回填（原为再 stat 一次）
         fp = os.path.join(root or "", p)
         try:
             st = os.stat(fp)
@@ -154,6 +196,8 @@ def snapshot(root: str, index_nodes) -> dict:
             node_files[p] = [None, None, None]     # 读不到即「证不出」，判据侧据此判陈旧
         else:
             node_files[p] = [st.st_mtime_ns, st.st_size, _file_digest(fp)]
+            if p in files:
+                files[p] = st.st_mtime_ns
     return {"nodes": len(index_nodes or {}),
             "dir_mtimes": {d: _mtime_ns(os.path.join(root or "", d)) for d in dirs},
             "file_mtimes": files,
@@ -175,6 +219,18 @@ def stale_reason(root: str, index_nodes, meta=None) -> str:
     「合作写者」（走 atomic_write ⇒ 目录 mtime 必变）与跨进程写（`_index.json`
     mtime 变化）；**同进程内的就地改写**两层都漏（实测：目录 mtime 逐位不变、
     `_index.json` 不变 ⇒ 旧判据返回 ''），故补 `node_files` 内容层收口。
+
+    #178（热路径去 IO）：内容层原先在**每次调用**里逐节点整文件读盘 + sha256，而它
+    落在检索热路径上（`MdCG.search` → `_pd.stale_reason`；实测 800 节点 116ms ≈
+    146µs/节点）。现改为经 `_file_digest_memo(fp, st)` 取指纹：按 (mtime_ns, size,
+    **ctime_ns**) 三项 stat 身份在**进程内**记忆化，命中即复用、**不读盘**；未命中
+    才读盘算 digest。判据语义、返回串、快照 schema（3 元组）**逐位不变**。
+
+    为什么不削弱 #131：`st_ctime_ns` 是 **inode 状态变更时间**，用户态**无法**用
+    `utime` / `utimensat` / `cp -p` / `rsync -t` 伪造——那些只还原 mtime。故「三项
+    stat 身份逐位相等」等价于「内容自上次读取以来未被改动」，复用**不可能**返回过期
+    digest；mtime 被还原、size 不变的就地改写 ⇒ **ctime 必变** ⇒ 未命中 ⇒ 重算 ⇒
+    与快照不符 ⇒ 仍判 `content_changed`。
     """
     if not index_nodes:
         return "no_index"
@@ -188,26 +244,41 @@ def stale_reason(root: str, index_nodes, meta=None) -> str:
     if snap.get("nodes") != len(index_nodes):
         return "node_count_changed"
     want = snap.get("dir_mtimes") or {}
+    # [#154①] 三趟「按 index_nodes 派生集合」（目录 / 根级文件 / 节点路径）收成一趟：
+    # 原实现每节点算两次 os.path.dirname；本趟内 os.stat 亦记忆化——根级文件在
+    # file_mtimes 层与内容层会在同一次调用里各 stat 一次。判据与返回串逐位不变。
+    _stat_cache = {}
+    def _stat_of(_p):
+        if _p not in _stat_cache:
+            try:
+                _stat_cache[_p] = os.stat(_p)
+            except OSError:
+                _stat_cache[_p] = None
+        return _stat_cache[_p]
     dirs_now = set()
+    files_now = set()
+    paths_now = set()
     for e in index_nodes.values():
-        d = os.path.dirname((e or {}).get("path") or "")
+        _p = (e or {}).get("path") or ""
+        d = os.path.dirname(_p)
+        if _p:
+            paths_now.add(_p)
+            if not d:
+                files_now.add(_p)
         if d:
             dirs_now.add(d)          # 根级路径（无目录）由 file_mtimes 记账，见下
     if set(want.keys()) != dirs_now:
         return "dirs_changed"
     for d, mt in want.items():
-        if _mtime_ns(os.path.join(root or "", d)) != mt:
+        _st = _stat_of(os.path.join(root or "", d))
+        if (_st.st_mtime_ns if _st is not None else None) != mt:
             return "dir_touched"
     want_files = snap.get("file_mtimes") or {}
-    files_now = set()
-    for e in index_nodes.values():
-        p = (e or {}).get("path") or ""
-        if p and not os.path.dirname(p):
-            files_now.add(p)
     if set(want_files.keys()) != files_now:
         return "root_files_changed"
     for p, mt in want_files.items():
-        if _mtime_ns(os.path.join(root or "", p)) != mt:
+        _st = _stat_of(os.path.join(root or "", p))
+        if (_st.st_mtime_ns if _st is not None else None) != mt:
             return "root_file_touched"
     if snap.get("index_mtime") != _mtime_ns(os.path.join(root or "", "_index.json")):
         return "index_touched"
@@ -217,18 +288,12 @@ def stale_reason(root: str, index_nodes, meta=None) -> str:
         # 旧快照（本层引入前构建）无法证明「表与正文同源」——按「宁可慢，不可
         # 丢召回」的既有承诺 fail-closed：判过期、回退全量（重建一次即补上本层）。
         return "no_content_snapshot"
-    paths_now = set()
-    for e in index_nodes.values():
-        p = (e or {}).get("path") or ""
-        if p:
-            paths_now.add(p)
     if set(want_nf.keys()) != paths_now:
         return "node_files_changed"
     for p, rec in want_nf.items():
         fp = os.path.join(root or "", p)
-        try:
-            st = os.stat(fp)
-        except OSError:
+        st = _stat_of(fp)
+        if st is None:
             return "node_file_missing"       # 快照里有、盘上没了 ⇒ 表必过期
         if not isinstance(rec, (list, tuple)) or len(rec) < 2:
             return "no_content_snapshot"
@@ -236,7 +301,7 @@ def stale_reason(root: str, index_nodes, meta=None) -> str:
             return "content_changed"         # ① 快路径：时间戳/长度任一变化即陈旧
         # ② 双双相等**不足以定身份**——mtime 可被还原（cp -p / rsync -t / 备份
         #    还原 / 粗粒度文件系统），等长改写会同时满足两式 ⇒ 比内容哈希。
-        if rec[2] is None or _file_digest(fp) != rec[2]:
+        if rec[2] is None or _file_digest_memo(fp, st) != rec[2]:
             return "content_changed"
     return ""
 

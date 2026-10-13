@@ -9,6 +9,86 @@
 
 ---
 
+## [0.8.1-opt.2] — 2026-10-13
+
+**基于上游提交** `4169c5bdb90f71f5bba99b56c4b99650472ee52c`（上游 `main`，
+比 `opt.1` 的基线 `958097d` **前进 54 个提交 / 81 个文件**）。
+
+本版是**同步上游 + 对既有改动做诚实修订**，不新增优化轮次。
+
+### 同步上游（54 个提交）
+
+冲突 5 处，全部解决：
+
+| 文件 | 冲突性质 | 处置 |
+|---|---|---|
+| `md_cg/mdcg.py` | **真实语义冲突 2 处** | 保留本衍生版的「枚举 → 并发读盘 → 串行解析」三遍结构；把上游新增的**密级值域判据**移植进解析遍 |
+| `README.md` | COGMAP 自动生成段 2 处 | **不手工解**，交由 `scripts/cogmap_sync.py build` 重生成（含链接前缀与行号重算） |
+| `WORKSPACE_INDEX.md` · `docs/mdcg/功能调用映射表_v0.1.md` · `docs/reference/配置参数表_v0.1.md` | 生成件 | 分别用 `workspace_index.py --write` / `cogmap_sync.py build` / `gen_config_doc.py` 重新生成 |
+
+自动合并成功的文件包括 `md_cg/mdcos.py`、`md_cg/config_registry_bulk.py`、`scripts/workspace_index.py`。
+
+### R5 / R6 的处置（诚实修订）
+
+**上游已自行修复我们 R5/R6 针对的两个问题**（issue #172 与 #144 均已 CLOSED），
+且上游的修法在关键处**更好**。故本版对这两轮做如下修订（**结论已逐行核对合并后的代码**）：
+
+| 轮次 | 上游处置 | 本衍生版处置 |
+|---|---|---|
+| **R6**（#144：证伪裁决一次调用即硬删，不可恢复） | 已修：改走 `_forget_apply` **单点**——与 `forget` 同一条可恢复路径（`trash/` + 删除清单 + `_unstage` + 遗忘审计），纯 `MdCG` 兜底也**绝不退化成硬删**；并额外修掉「证伪正文前 200 字以 internal 明文落盘」的泄露 | **一半让位、一半保留**。让位部分：上游方案更彻底（本衍生版原方案在「回收站搬不动」时会退回 `os.remove`）⇒ 删除本衍生版的 `_retire_path`（已无调用点）。保留部分：上游的 `verify(falsified)` 从 `protect.guard_forget` **直接跳到 `add_rejected`**，直到 `_forget_apply` 内部才碰路径 ⇒ 路径越界时**副作用已产生**；本衍生版在 `add_rejected` **之前**的 `_node_disk_path` 闸（越界即 `falsified_blocked`、零副作用）上游没有，**予以保留** |
+| **R5**（#172：`restore()` 路径穿越） | 只修了 `restore()` **入口**（`_restore_id_ok`，与 `add` 的 P0-1 白名单同源、先拦后读、零 IO）；`_forget_apply` 的 `src` / `dst` **两处至今仍是裸拼** | **完整保留，覆盖面是上游的超集**：`_trash_path` 单点同时覆盖 `restore` 的 `src` 与 `_forget_apply` 的 `dst`（并**保留**上游的 `_restore_id_ok` 作纵深）；`_forget_apply` 的 `src` 另走读面同源的 `_node_disk_path`（P2-20）。即上游两条裸拼路径本衍生版都堵了（见下节） |
+
+### 仍然有效的独立发现（本衍生版独有）
+
+- **`_forget_apply` 的 `src` / `dst` 双裸拼 —— 上游 #172 未覆盖的那一半。**
+  上游 #172 的正文明确写着：「`add()` 有 P0-1 白名单，**`forget()` 走索引检查**，唯独
+  `restore()` 漏网」——即上游认为 forget 面是安全的。但这个前提不成立：`forget` 的
+  `node_id` 取自**索引**，而索引 id 直接抄盘上 frontmatter（`_scan_nodes` 只做 `str` 归一、
+  **不校验形状**）⇒ 手改一个 `.md` 的 `id:` 字段即可污染它，使 `os.replace(src, dst)` 的
+  **目标**落在 `trash/` 之外 = **任意路径覆写**。上游 `main`（`4169c5bd`）至今仍是
+  `src = os.path.join(self.root, e["path"])` 与 `dst = os.path.join(self.trash_dir, f"{node_id}.md")`
+  **两条都是裸拼、无闸**。
+  本衍生版在 `dst` 处保留单点闸 `_trash_path`（字面闸 + realpath 闸，越界即结构化负路由、
+  零 IO）；`src` 处走读面同源的 `_node_disk_path`（P2-20）。**关掉 issue ≠ 修全了面。**
+
+### 修复（上游遗留 · 本衍生版顺带订正）
+
+- **`package.json` 的 `prepare` 脚本误伤 `npm pack --dry-run`，致上游发版门禁
+  `publish-artifact-check` 恒红。** 上游 issue #161 的「不可用包」检查在 `typescript`
+  未安装且 `lib/index.js` 不存在时主动 `exit 1`；而 `scripts/check_publish_artifact.py`
+  靠 `npm pack --dry-run --json` 取发布清单，`npm pack` 会触发 `prepare` ⇒ 门禁取不到清单，
+  以 `exit 2`（fail-closed）恒红。
+  **实测上游 `main` 连续 7 次 `publish-artifact-check` 全部 failure**（含最新 `4169c5bd`），
+  CI 日志与本机复现**逐字一致**。
+  修法：在 `prepare` 的**报错分支之前**插入 dry-run 分支，判据
+  `process.env.npm_config_dry_run === 'true'`（实测 npm 在 `npm pack --dry-run` 时会设该变量）。
+  **#161 对真实安装的保护逐位不变**——非 dry-run 时仍 `exit 1`（实测确认）。
+  **已上报上游 [#221](https://github.com/FuRongJun-1999/dsh-memory/issues/221)**。
+
+### 验证
+
+- 守卫链全绿：`cogmap` / `workspace-index`（顶层目录 21 · 追踪 2487 件）/ `check_local_paths` /
+  `check_publish_artifact`（R1–R7）/ `config_registry_guard`（PASS 7 / FAIL 0）/
+  `test_check_config_env_registry`（20/20）/ `verify_discipline`（10/10）
+- **本机定向验证 23/23 通过**（覆盖手工解冲突所涉的全部代码路径）：`test_issue146_frontmatter_quarantine`
+  （移植的密级值域判据）、`test_p28_refcheck`、`test_p9_forget_protect`、
+  `test_n130_verify_falsified_protect`、`test_n209_verify_write_face_gates`、`test_p39_verify_flow`、
+  `test_lifecycle_retire_leak`、上游新增的 `test_issue197/211/214_*`、上游改动的
+  `test_export_snapshots` / `test_i50c_meta_passthrough` / `test_interop_judgment` /
+  `test_issue130_*` / `test_issue91_*` / `test_p47_*` / `test_recall_face_guards` / `test_tool_face`。
+  另全量 `md_cg` 组按字母序跑到 `d` 的 45 项亦全通过（全量串行约需 1 小时，权威读数以 CI 为准）。
+- **`md_cg` 目标数 327 → 341**：上游 issue #185 把收集面从**非递归**改成**递归**，
+  14 个子目录测试**首次进入收集面**（此前既不是红也不是绿，是**不存在**）。
+- **CI 状态变化（如实记录）**：`cogmap` / `workspace-index` / `publish-artifact` /
+  `conformance` / `hive` / `discipline` 全绿；**`python-tests` 由绿转红**——3 项失败，
+  **全部继承自上游**（上游同 SHA `4169c5bd` 的 CI 是同一份清单：`462/465 通过 · 7 跳过`）。
+  逐项根因与处置见 `NOTICE.md §8.4`；已上报上游
+  [#234](https://github.com/FuRongJun-1999/dsh-memory/issues/234)。
+  **刻意不修**（②③ 的修法要改测试文件，违背「零测试改动」承诺；只修①买不到绿）。
+- **未修改任何测试文件**（上游带来的新测试文件随合并进入）
+
+---
+
 ## [0.8.1-opt.1] — 2026-10-13
 
 **基于上游提交** `958097d0559585be544cd16323a3a96eca29a461`（上游 v0.8.1）。
@@ -84,6 +164,7 @@
   npm 其实已经 `added 1 package, and audited 2 packages in 7s`。6 条矩阵腿（3 平台 × 2 Node）
   **全部**挂在这一行。上游已给另一个诊断步加了 `continue-on-error: true`，唯独漏了这一条。
   修法：补 `|| true`（与上游对该文件其余诊断步的处置一致）。订正后该步 6/6 通过。
+  **已上报上游 [#223](https://github.com/FuRongJun-1999/dsh-memory/issues/223)**。
   > 诚实标注：这是**上游工作流的遗留缺陷**，不是本衍生版引入的；本衍生版基线
   > `958097d` 原样带着它。因为该工作流只在 `workflow_dispatch` 或改它自身时触发，
   > 普通推送不会让它变红——但一个**不可能通过**的工作流留在仓库里是负债，故顺手订正。
@@ -105,6 +186,7 @@
   npm 产物**中，本仓库不发布 npm 包，改本仓库 `package.json` 无法影响 registry 上的 tarball。
   用户绕过办法：`npm install @furongjun1999/dsh-memory @deepseek-ai/schemastery`
   （README 的 FAQ 已收录）。详见 `NOTICE.md` §8。
+  **已上报上游 [#222](https://github.com/FuRongJun-1999/dsh-memory/issues/222)**。
 
 ### 安全
 
@@ -138,6 +220,7 @@
    扫描路径**已无此窗口**。
 4. `_nodecache.json` 只在 `close()` 时落盘；强杀进程不落盘，退化为下次冷启动。
 5. 本衍生版基线为上游 `958097d`，**不包含此后上游的新提交**。
+   > 〔opt.2 修订〕本项已在 `[0.8.1-opt.2]` 中解决：基线已前进到上游 `4169c5bd`。保留此条是为了让读者看到当时的真实边界。
 
 ---
 

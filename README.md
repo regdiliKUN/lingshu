@@ -26,11 +26,12 @@
 >
 > 本仓库是 **[FuRongJun-1999/dsh-memory](https://github.com/FuRongJun-1999/dsh-memory)（灵枢 LINGSHU）** 的**优化衍生版**，**不是原创项目**。
 >
-> - **上游作者**：符荣峻（FuRongJun-1999）· 上游许可：**MIT** · 本仓库基线：上游 `958097d`
+> - **上游作者**：符荣峻（FuRongJun-1999）· 上游许可：**MIT** · 本仓库基线：上游 `4169c5bd`（`v0.8.1-opt.2` 起）
 > - **上游仓库**：<https://github.com/FuRongJun-1999/dsh-memory>
 > - **本仓库做了什么**：在上游代码之上做了 **11 轮系统性源码优化**（性能 + 三个真实缺陷修复），详见 [本衍生版做了什么](#-本衍生版做了什么11-轮优化) 与 [docs/fork/](docs/fork/)
 > - **署名与许可**：原始版权归 FuRongJun-1999 所有，`LICENSE` **原样保留**；本仓库的改动部分同样以 MIT 发布。完整归属说明见 [NOTICE.md](NOTICE.md)
 > - **提 Issue 前请注意**：与上游本身相关的问题请提到[上游仓库](https://github.com/FuRongJun-1999/dsh-memory/issues)；只有**本仓库引入的改动**相关的问题才提到这里
+> - **关于上面的 CI 徽章**：`install-verify` 与 `python-tests` 当前是**红的，且红得正确**——两者的失败都**继承自上游**（前者是上游 registry 上已发布 npm 产物的缺陷，后者是上游同 SHA 的同一份失败清单），逐项根因与上报链接见 [验证与诚实边界](#验证与诚实边界) 与 [NOTICE.md §8](NOTICE.md)。本仓库**刻意不把检查改成通过**——那等于藏掉真缺陷
 >
 > 如果你要的是原版、最新版、或完整功能，请直接使用上游仓库。
 
@@ -260,7 +261,8 @@ npx @furongjun1999/dsh-memory init -- --end claude --root /path/to/memory --pyth
 
 > ⚠️ **`npx` 这条路当前会失败**——它拉的是 registry 上**上游已发布的包**，而该包有一个
 > 未声明的 peer 依赖（`ERR_MODULE_NOT_FOUND: @deepseek-ai/schemastery`）。绕过办法与根因
-> 见 [FAQ](#-常见问题上手向) 与 [NOTICE.md §8.2](NOTICE.md)。
+> 见 [FAQ](#-常见问题上手向) 与 [NOTICE.md §8.2](NOTICE.md)；**已上报上游
+> [#222](https://github.com/FuRongJun-1999/dsh-memory/issues/222)**。
 > **本衍生版不发布 npm 包**，故推荐走**方式一（MCP 直挂）**或**方式二（从本仓构建插件）**，
 > 两者都不依赖 registry 上那个 tarball。
 
@@ -491,13 +493,45 @@ lingshu/
 | R2 | 首次检索零 open | 正文旁路缓存 `_nodecache.json`（独立文件，不污染索引） |
 | R3 | 消除逐节点 stat / islink | 目录条目表（`os.scandir` 一次枚举，TTL 1 s） |
 | R4 | 冷启动也免 open | 扫描复用旁路缓存 |
-| R5 | 修补路径穿越（上游 issue #172） | `_trash_path` 单点闸门 |
-| R6 | 证伪裁决改为可恢复（上游 issue #144） | `_retire_path` 走回收站而非硬删 |
+| R5 | 修补路径穿越（上游 issue #172） | `_trash_path` 单点闸门（**opt.2 修订**：完整保留且强于上游——上游只修了 `restore()` 入口，`_forget_apply` 的 `src`/`dst` 两处仍是裸拼） |
+| R6 | 证伪裁决改为可恢复（上游 issue #144） | **opt.2 修订：一半让位上游**——`_retire_path` 删除（上游的 `_forget_apply` 单点更彻底）；但本衍生版独有的「`add_rejected` 之前拦越界」前置路径闸保留 |
 | R7 | 旁路缓存健壮性 | 三重规模上限 + 9 种坏档自愈 |
 | R8 | 冷启动并发读盘 | 三遍扫描 + 线程池（3.6×） |
 | R9 | **回归修复**（把「快」换回「对」） | 修掉 R4 引入的真 bug + 2 处纪律违规 |
 | R10 | **生产类双读归零** | `MdCGSecure` 真冷启动从 2N 次 open 降到 N 次 |
 | R11 | **接线缺陷订正** | `direct_read` 未穿透缓存（被掩盖 9 轮的真实缺陷） |
+
+### 与上游同步（v0.8.1-opt.2 · 2026-10-13）
+
+本版合并上游 **54 个提交 / 81 个文件**（基线 `958097d` → `4169c5bd`），并对既有改动做了**诚实修订**：
+
+- **R6 一半让位上游**：上游已自行修复 #144，且更彻底——改走 `_forget_apply` 单点（与 `forget`
+  同一条可恢复路径 + 写删除清单 + 遗忘审计），纯 `MdCG` 兜底也**绝不退化成硬删**，还额外修掉了
+  「证伪正文前 200 字以 internal 明文落盘」的泄露。本衍生版的 `_retire_path` 已删除。
+  **但本衍生版独有的前置路径闸保留**：上游的 `verify(falsified)` 直到 `_forget_apply` 内部才碰
+  路径，此时 `add_rejected` 的副作用**已经落盘**；本衍生版在 `add_rejected` **之前**拦越界，
+  越界即返回 `falsified_blocked`、**零副作用**。
+- **R5 完整保留，覆盖面是上游的超集**：上游 #172 只修了 `restore()` **入口**（`_restore_id_ok`）；
+  而 `_forget_apply` 的 `src = os.path.join(self.root, e["path"])` 与
+  `dst = os.path.join(self.trash_dir, f"{node_id}.md")` **两处至今仍是裸拼**。上游 #172 的正文认为
+  「`forget()` 走索引检查」故安全，而索引 id 直接抄盘上 frontmatter、**不校验形状**，手改一个
+  `.md` 的 `id:` 即可让 `os.replace` 的**目标**越出 `trash/` = **任意路径覆写**。本衍生版的
+  `_trash_path` 单点**同时**覆盖 `restore` 的 `src` 与 `_forget_apply` 的 `dst`（并保留上游的
+  `_restore_id_ok` 作纵深），`_forget_apply` 的 `src` 另走 `_node_disk_path`（P2-20）
+  ⇒ **上游两条裸拼路径本衍生版都堵了**。
+- **顺带订正一个上游遗留缺陷**：`prepare` 脚本误伤 `npm pack --dry-run`，导致上游自己的发版门禁
+  `publish-artifact-check` **连续 7 次全红**（含最新提交 `4169c5bd`）。修法是在报错分支前加
+  dry-run 分支，**#161 对真实安装的保护逐位不变**（非 dry-run 时仍 `exit 1`）。
+  详见 [NOTICE.md §8.3](NOTICE.md)；**已上报上游
+  [#221](https://github.com/FuRongJun-1999/dsh-memory/issues/221)**。
+- **三个上游缺陷都已上报**：[#221](https://github.com/FuRongJun-1999/dsh-memory/issues/221)
+  （`prepare` 打爆发版门禁）、[#222](https://github.com/FuRongJun-1999/dsh-memory/issues/222)
+  （npm 包干净安装后无法 import）、[#223](https://github.com/FuRongJun-1999/dsh-memory/issues/223)
+  （`npm ls` 诊断步杀整步并掩盖前者的信号）。
+
+> 5 处冲突全部解决：`md_cg/mdcg.py`（真实语义冲突 2 处——保留本衍生版的三遍扫描结构，同时把上游
+> 新增的**密级值域判据**移植进解析遍）、`README.md`（COGMAP 自动生成段，**不手工解**、交
+> `cogmap_sync.py build` 重生成）、3 个生成件（分别重新生成）。
 
 ### 后三轮挖出的三个真实缺陷
 
@@ -508,9 +542,11 @@ lingshu/
 ### 验证与诚实边界
 
 - **结果等价性**：优化全开 vs 全关，8 组查询 ×（id, score, 资格状态）、recall id 序列、400 个索引键、400 个内容哈希——**逐位一致**。
-- **`md_cg` 组测试套件**：`317/327 通过 · 3 跳过 · 10 失败`；10 项**全部落在上游基线失败集合内** ⇒ **新增失败 0**。**未修改任何测试文件**。
-- **CI 全量套件**（455 目标 / 6 组）：`cogmap` / `workspace-index` / `publish-artifact` / `conformance` / `hive` / `discipline` 全绿；`python-tests` **首轮抓出了 1 项本衍生版自己引入的缺陷**——优化新增的 4 个环境变量未进配置登记面，反向对账守卫（上游 issue #120）转红。已按上游补登记先例修好（登记面 721 → 725，该守卫 20/20 通过）。**如实记录而非隐藏**。
-- **诚实边界**：① 读数基于**合成 2000 节点库**，万级未实测；② 本机墙钟噪声 ±15~30%，故以**系统调用计数**为主证；③ 改动**未提交到上游**，本仓库以独立提交形式携带；④ 优化期间只跑了 `md_cg` 组套件、漏跑 `scripts` 组，这正是上一条缺陷溜过自检的原因——**选测试组要按「哪些守卫可能被改动触怒」，不是按「改了哪些文件」**。
+- **`md_cg` 组测试套件**：`opt.1`（基线 `958097d`）为 `317/327 通过 · 3 跳过 · 10 失败`，10 项**全部落在上游基线失败集合内** ⇒ **新增失败 0**。`opt.2`（基线 `4169c5bd`）目标数 **327 → 341**——上游 issue #185 把收集面从**非递归**改成**递归**，14 个子目录测试**首次进入收集面**（此前既不是红也不是绿，是**不存在**）。**未修改任何测试文件**。
+- **CI 全量套件**：`cogmap` / `workspace-index` / `publish-artifact` / `conformance` / `hive` / `discipline` 全绿。两条**已知红，且红得正确**（都不隐藏）：
+  - **`install-verify`**：上游 registry 上 `@furongjun1999/dsh-memory@0.8.1` 的**已发布产物**缺陷（`optional: true` peer 被入口静态导入）⇒ 本仓不发布 npm 包、修不了，故保留红灯 + 明示 + 给绕过办法（见 [NOTICE.md §8.2](NOTICE.md)）。
+  - **`python-tests`**（`opt.2` 起）：3 项失败，**全部继承自上游**——上游同 SHA `4169c5bd` 的 CI 是**同一份失败清单**（`462/465 通过 · 7 跳过`）。三项均为**恒红**：① `check_guard_coverage` 的 #179 反向判据把构建产物 `lib/index.js` 误判为「被点名脚本」；② `test_ecosystem_assembly` 硬编码 Windows 分隔符（被 #185 的递归收集首次暴露）；③ `test_issue211_export_target` 的 U10 断言 `aux` 是 Windows 保留设备名（POSIX 上不可能成立）。②③ 在本机 Windows 上**全绿**，可确认是平台可移植性而非逻辑缺陷。**已上报上游 [#234](https://github.com/FuRongJun-1999/dsh-memory/issues/234)**。
+- **诚实边界**：① 读数基于**合成 2000 节点库**，万级未实测；② 本机墙钟噪声 ±15~30%，故以**系统调用计数**为主证；③ 改动**未提交到上游**，本仓库以独立提交形式携带；④ 优化期间只跑了 `md_cg` 组套件、漏跑 `scripts` 组，这正是下一条缺陷溜过自检的原因——**选测试组要按「哪些守卫可能被改动触怒」，不是按「改了哪些文件」**；⑤ `opt.2` 起 `python-tests` 的红**不是本衍生版引入**，但它的存在意味着这条流水线**暂时不携带信号**（恒红），因此分支保护**未**把它设为必需检查。
 
 ---
 
@@ -586,14 +622,19 @@ npm install @furongjun1999/dsh-memory @deepseek-ai/schemastery
 > 该缺陷位于 registry 上**上游已发布的 tarball** 里，本衍生版不发布 npm 包，改本仓库代码
 > 无法影响它。本仓库的 CI 有一条 `install-verify` 会**持续把这条红灯亮着**——这是有意的，
 > 不把检查改成通过等于藏掉一个真缺陷。
+>
+> **已上报上游：[#222](https://github.com/FuRongJun-1999/dsh-memory/issues/222)**。
 </details>
 
 <details>
 <summary><b>我该用这个衍生版还是上游原版？</b></summary>
 
 - **要最新功能 / 最全能力 / 官方支持** → 用[上游原版](https://github.com/FuRongJun-1999/dsh-memory)。
-- **只关心首次装载与检索的启动速度，或需要 R5/R6 的安全闸** → 本衍生版。
-- 本衍生版基线是上游 `958097d`，**不包含此后上游的新提交**。
+- **只关心首次装载与检索的启动速度** → 本衍生版（这是本版唯一的核心增量：**系统调用层重构**）。
+- **需要 `_forget_apply` 的路径闸** → 本衍生版（这是上游 #172 未覆盖的那一半，见上文「与上游同步」）。
+- 本衍生版基线已同步到上游 `4169c5bd`（v0.8.1-opt.2）。此后上游的新提交仍不在本版内。
+- **安全类修复（#144 证伪软删 / #172 restore 面）上游原版也已具备**——opt.2 已把它们同步进来，
+  本版不再声称在这两项上「比上游更安全」。
 </details>
 
 ---
@@ -1038,23 +1079,23 @@ python test/locomo_jaccard_probe.py      # 主路线 Jaccard 口径拆解（J2_f
 
 | 基元 | op 数 | op 清单（点击直达实现分支） |
 |---|---|---|
-| **[`cg`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L640)** 认知图统一入口 | 38 | [`help`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2084) [`state_event`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2445) [`status`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2093) [`edges`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2096) [`theory`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2099) [`link`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2116) [`info`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2245) [`route`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2286) [`read`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2307) [`audit`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2367) [`write`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2387) [`goal`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2395) [`task`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2430) [`recent`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2433) [`verify`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2465) [`review`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2470) [`forget`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2491) [`protect`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2500) [`identity`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2503) [`consistency`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2506) [`metacognition`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2509) [`self_state`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2512) [`evolution`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2515) [`sustain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2518) [`scrub`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2521) [`predict`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2524) [`causal`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2527) [`whitebox`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2530) [`index_code`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2533) [`index_doc`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2577) [`ref`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2620) [`session`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2623) [`ingest`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2626) [`export`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2629) [`maintain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2632) [`consolidate`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2635) [`insight`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2638) [`ccg`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2641) |
-| **[`stg`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L987)** 语义时空图入口 | 5 | [`relation`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3245) [`timeline`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3247) [`anchors`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3254) [`consistency`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3258) [`state_chain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3261) |
+| **[`cg`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L640)** 认知图统一入口 | 38 | [`help`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2114) [`state_event`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2485) [`status`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2123) [`edges`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2126) [`theory`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2129) [`link`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2146) [`info`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2285) [`route`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2326) [`read`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2347) [`audit`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2407) [`write`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2427) [`goal`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2435) [`task`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2470) [`recent`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2473) [`verify`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2505) [`review`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2510) [`forget`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2531) [`protect`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2540) [`identity`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2543) [`consistency`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2546) [`metacognition`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2549) [`self_state`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2552) [`evolution`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2555) [`sustain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2558) [`scrub`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2561) [`predict`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2564) [`causal`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2567) [`whitebox`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2570) [`index_code`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2573) [`index_doc`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2617) [`ref`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2660) [`session`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2663) [`ingest`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2666) [`export`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2669) [`maintain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2672) [`consolidate`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2675) [`insight`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2678) [`ccg`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2681) |
+| **[`stg`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L987)** 语义时空图入口 | 5 | [`relation`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3294) [`timeline`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3296) [`anchors`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3303) [`consistency`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3307) [`state_chain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3310) |
 
 **op → 实现模块**（认知图投影：功能在哪段代码，一眼可达）：
 
 | op（点击直达实现分支） | 实现模块（点击直达源码） |
 |---|---|
-| [`help`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2084) [`state_event`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2445) [`status`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2093) [`edges`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2096) [`route`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2286) [`task`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2430) [`recent`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2433) [`verify`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2465) [`review`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2470) [`forget`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2491) [`protect`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2500) [`identity`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2503) [`consistency`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2506) [`metacognition`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2509) [`self_state`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2512) [`evolution`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2515) [`sustain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2518) [`scrub`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2521) [`predict`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2524) [`causal`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2527) [`whitebox`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2530) [`ref`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2620) [`session`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2623) [`ingest`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2626) [`export`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2629) [`maintain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2632) [`consolidate`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2635) [`insight`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2638) [`ccg`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2641) | [`_cg_dispatch` 内联](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2081) |
-| [`index_code`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2533) [`index_doc`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2577) | [`refindex`](md_cg/refindex.py), [`security`](md_cg/security.py) |
-| [`info`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2245) | [`audit`](md_cg/audit.py), [`generation`](md_cg/generation.py), [`links`](md_cg/links.py), [`nodefile`](md_cg/nodefile.py), [`theory`](md_cg/theory.py) |
-| [`audit`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2367) | [`auditview`](md_cg/auditview.py) |
-| [`link`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2116) | [`evidence`](md_cg/evidence.py), [`links`](md_cg/links.py), [`provenance`](md_cg/provenance.py), [`security`](md_cg/security.py), [`signer`](md_cg/signer.py) |
-| [`goal`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2395) | [`goal_gen`](md_cg/goal_gen.py) |
-| [`read`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2307) | [`refindex`](md_cg/refindex.py) |
-| [`theory`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2099) | [`theory`](md_cg/theory.py) |
-| [`write`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2387) | [`writepipe`](md_cg/writepipe.py) |
-| [`relation`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3245) [`timeline`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3247) [`anchors`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3254) [`consistency`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3258) [`state_chain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3261) | [`_stg_call` 内联](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3226) |
+| [`help`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2114) [`state_event`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2485) [`status`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2123) [`edges`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2126) [`route`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2326) [`task`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2470) [`recent`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2473) [`verify`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2505) [`review`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2510) [`forget`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2531) [`protect`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2540) [`identity`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2543) [`consistency`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2546) [`metacognition`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2549) [`self_state`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2552) [`evolution`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2555) [`sustain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2558) [`scrub`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2561) [`predict`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2564) [`causal`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2567) [`whitebox`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2570) [`ref`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2660) [`session`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2663) [`ingest`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2666) [`export`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2669) [`maintain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2672) [`consolidate`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2675) [`insight`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2678) [`ccg`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2681) | [`_cg_dispatch` 内联](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2111) |
+| [`index_code`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2573) [`index_doc`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2617) | [`refindex`](md_cg/refindex.py), [`security`](md_cg/security.py) |
+| [`info`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2285) | [`audit`](md_cg/audit.py), [`generation`](md_cg/generation.py), [`links`](md_cg/links.py), [`nodefile`](md_cg/nodefile.py), [`theory`](md_cg/theory.py) |
+| [`audit`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2407) | [`auditview`](md_cg/auditview.py) |
+| [`link`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2146) | [`evidence`](md_cg/evidence.py), [`links`](md_cg/links.py), [`provenance`](md_cg/provenance.py), [`security`](md_cg/security.py), [`signer`](md_cg/signer.py) |
+| [`goal`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2435) | [`goal_gen`](md_cg/goal_gen.py) |
+| [`read`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2347) | [`refindex`](md_cg/refindex.py) |
+| [`theory`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2129) | [`theory`](md_cg/theory.py) |
+| [`write`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L2427) | [`writepipe`](md_cg/writepipe.py) |
+| [`relation`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3294) [`timeline`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3296) [`anchors`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3303) [`consistency`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3307) [`state_chain`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3310) | [`_stg_call` 内联](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L3275) |
 
 **细粒度面**（`MDCG_MCP_SURFACE=full`，插件运行时使用）：[`cg`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L640) + [`stg`](https://github.com/regdiliKUN/lingshu/blob/main/md_cg/mcp_server.py#L987) + **31 个 `mdcg_*`** = **33 个工具**：
 

@@ -19,6 +19,7 @@ P0 风险（基线功能）：
 import os
 import re
 import json
+import sys
 import math
 import time
 import atexit
@@ -34,6 +35,19 @@ from .fsutil import (FileLock, ShardedLog, atomic_write, append_jsonl,
                      # 第 6 轮（issue #144）：证伪节点的**可恢复摘除**要搬文件，
                      # 复用 forget 路径同一个 publish（原子替换/跨卷回落）。
                      publish)
+
+
+# ---- issue #173（健壮性）：形如 list(x or []) 的写法会把字符串静默拆成单字符 ----
+# 单点守卫：写入 / 发出路径的 6 处调用点统一走 _ensure_list——str 按「一个值」
+# 处理（不再逐字符展开）；None / 空串按空列表（与改动前逐位一致）；其余可迭代
+# 仍 list(x)。
+def _ensure_list(x):
+    """归一成列表：任何假值（None/空串/0/False/[]）-> []；str -> [str]；其它可迭代 -> list(x)。"""
+    if not x:
+        return []
+    if isinstance(x, str):
+        return [x]
+    return list(x)
 
 # 五层 + 两类负记忆 + 目标槽（白箱记忆七件套工程化：事实/规则→knowledge；
 # 假设→contextual；失败/未解→独立目录；目标→goals）。
@@ -1797,6 +1811,47 @@ def _require_unit_number(field, value) -> float:
     return v
 
 
+# ---- issue #146③：密级行的**值域**判据（fail-closed，单一真源 = security）----
+# 病象：`sensitivity: "机密"`（类型对、值域错）能过 nodefile.frontmatter_problem
+# 的类型判据进索引；此后按「未知密级」消费时要么在 _rank 抛 AccessDenied 打断
+# 整条检索链，要么被当成默认档——后者等于把「密级声明坏掉」静默**降级为明文**。
+# 故在装载面就地 fail-closed：隔离该节点（不进索引、不改盘）。
+def _sensitivity_problem(value) -> str:
+    """密级行值域判据：None（未声明）合法；不在阶梯里 → 原因串（fail-closed）。
+
+    阶梯的**唯一真源**是 security.SENSITIVITY_ORDER——延迟导入，本模块不另抄
+    一份（第二份判据迟早与真源漂移）。返回空串 = 无问题。
+    """
+    if value is None:
+        return ""                # 缺省合法：存量节点本就不带该键
+    from .security import SENSITIVITY_ORDER
+    if value in SENSITIVITY_ORDER:
+        return ""
+    return ("密级损坏（fail-closed，不降级为明文）：sensitivity=%r 不在 %s"
+            % (value, list(SENSITIVITY_ORDER)))
+
+
+# ---- issue #146②：隔离的**可观测面**（单一实现点）-----------------------------
+# 隔离本身是「静默消失」：节点不进索引、盘面不改，使用者只会觉得「记忆少了」。
+# 故每次全量扫描后把隔离清单写 stderr（与 fsutil.note_* 同一条可观测纪律：
+# 容忍 ≠ 静默）；告警写失败被吞掉——告警面不得反向破坏装载路径。
+def _warn_quarantined(items) -> None:
+    """把本次扫描的隔离清单写 stderr；空清单不打噪声。"""
+    if not items:
+        return
+    try:
+        lines = ["[mdcg] 装载隔离告警：%d 个坏节点被隔离（不进索引、不改盘、"
+                 "盘面真源保留）" % len(items)]
+        for nid in sorted(items):
+            info = items.get(nid) or {}
+            lines.append("  隔离 %s：%s（%s）"
+                         % (nid, info.get("path") or "?",
+                            info.get("reason") or ""))
+        sys.stderr.write("\n".join(lines) + "\n")
+    except Exception:                                  # noqa: BLE001
+        pass
+
+
 # 生效条件：构造须传入 root，经 os.path.abspath 后以 exist_ok=True 创建该目录及 LAYERS 各层子目录；autoflush 无论取值（默认 64）都原样赋给实例。
 class MdCG:
 
@@ -2572,6 +2627,17 @@ class MdCG:
             # _rel 已在枚举遍算出（第 4 轮）——此处不再重算 `os.path.relpath`：
             # 它是 2000 节点扫描里 0.13s 的纯冗余（同参数同结果），而 relpath
             # 内部要走 normcase/abspath。
+            # ①' 密级行**值域**判据（issue #146③，fail-closed）：类型判据只看
+            #     「是不是 str」，值域判据看「是不是阶梯里的档」——密级声明
+            #     坏掉的节点若被当默认档消费，等于**静默降级为明文**；故与
+            #     ① 同路隔离（不进索引、不改盘，修好后下次扫描自动回归）。
+            #     〔同步上游 4169c5bd〕上游把本判据加在 `os.walk` 循环体内，
+            #     本衍生版已把该循环重构为「枚举 → 并发读盘 → 串行解析」三遍
+            #     结构，故移植到解析遍——判据本身逐字未改，只换了所在位置。
+            _sec_bad = _sensitivity_problem(fm.get("sensitivity"))
+            if _sec_bad:
+                quarantined[nid] = {"path": _rel, "reason": _sec_bad}
+                continue
             # ① 类型可用性判据（单点，nodefile.frontmatter_problem）
             _prob = nodefile.frontmatter_problem(fm, content)
             if _prob:
@@ -2595,6 +2661,8 @@ class MdCG:
             if _keep_fm:
                 _scan_fm[nid] = fm
         # 隔离清单**每次全量扫描都重建**（不累加）——扫描即盘面真相，上一次
+        self._quarantined = quarantined
+        _warn_quarantined(quarantined)
         # 被隔离的文件修好后本次自动回归索引（自愈腿，与 legacy P3 同向）。
         self._quarantined = quarantined
         # 索引序确定性：按 nid 排序返回。枚举序（`_iter_md_files` 的 scandir
@@ -2707,31 +2775,6 @@ class MdCG:
             gen, table, links, now + self._dir_scan_ttl())
         return table, links
 
-    def _retire_path(self, node_id):
-        """证伪节点的回收站落点（第 6 轮，issue #144）；拿不到返回 None。
-
-        目录选择：有 `trash_dir` 的载体（MdCGOS）**复用它**——于是
-        `restore(node_id)` 天然能把证伪节点取回；纯 `MdCG` 用
-        `<root>/_falsified_trash`（惰性创建，不在 LAYERS 内、不进索引、
-        不进目录指纹）。
-        文件名：node_id 过 `_NODE_ID_RE` 且不含 `..` 才直接用，否则退化为
-        `nid_<sha1[:12]>`——**绝不让不可信 id 参与路径拼接**（与本轮
-        `mdcos._trash_path` 同一条纪律；差别是这里连非法 id 也必须能落地，
-        因为证伪裁决本身不该被一个脏 id 卡死）。
-        """
-        d = getattr(self, "trash_dir", None) or os.path.join(
-            self.root, "_falsified_trash")
-        try:
-            os.makedirs(d, exist_ok=True)
-        except OSError:
-            return None
-        nid = node_id if isinstance(node_id, str) else ""
-        if not (nid and len(nid) <= 128 and ".." not in nid
-                and nid == os.path.basename(nid)
-                and _NODE_ID_RE.match(nid)):
-            nid = "nid_" + hashlib.sha1(
-                str(node_id).encode("utf-8")).hexdigest()[:12]
-        return os.path.join(d, nid + ".md")
 
     def _dir_islink(self, rel_dir, name) -> bool:
         """该目录下该名字是否符号链接（免 syscall；拿不到就逐路径问）。"""
@@ -2968,7 +3011,7 @@ class MdCG:
         # issue #150：**入口过滤空 tag**——空串 tag 会让 tag_bonus 恒发（`"" in q`）、
         # 也会污染桶路由键；写入侧先净化，检索侧四处（expand_query_terms/_like/
         # tag_bonus/负覆盖）另加非空守卫，两侧冗余是刻意的 defense-in-depth。
-        tags = [t for t in (tags or []) if str(t).strip()]
+        tags = [t for t in _ensure_list(tags) if str(t).strip()]
         # 标准语义摘要（semantic/canonical.py：词表真源 + OOV 审计，警告不拒绝）。
         # 语义校验失败不阻断写入（与 derived_from 建链降级同风格）。
         if semantic is not None:
@@ -2997,7 +3040,7 @@ class MdCG:
                 except Exception:
                     _bd_pre = None
             if _bd_pre:
-                tags = list(tags or [])
+                tags = _ensure_list(tags)
                 tags.append("domain:" + str(_bd_pre))
         bucket = None
         d = os.path.join(self.root, layer)
@@ -3040,9 +3083,9 @@ class MdCG:
             "importance": importance, "confidence": confidence,
             "condition_space": cs, "tags": tags,
             "created_at": created_at,
-            "access_count": 0, "last_access": 0, "edges": list(edges or []),
+            "access_count": 0, "last_access": 0, "edges": _ensure_list(edges),
             "verification_basis": verification_basis,
-            "non_applicable_conditions": list(non_applicable_conditions or []),
+            "non_applicable_conditions": _ensure_list(non_applicable_conditions),
             # 证据计数（白箱第 5 篇第 4 章）：每次 verify 累加，正/反例分开记
             "evidence_count": 0, "positive_evidence": 0, "negative_evidence": 0,
         }
@@ -5406,7 +5449,7 @@ class MdCG:
                     # 否则下游按 state 判定的地方会把它读成资格结论）
                     r[0]["boundary_hit"] = True
                     r[0]["boundary_marker"] = _b.get("marker")
-                    r[0]["boundary_terms"] = list(_b.get("terms") or [])
+                    r[0]["boundary_terms"] = _ensure_list(_b.get("terms"))
                 for _k in ("accept", "reject", "defer", "blindspot"):
                     _bnd["counts"][_k] += int(
                         (_jw.get("counts") or {}).get(_k) or 0)
@@ -5690,8 +5733,9 @@ class MdCG:
         if not node:
             return None
         if verdict == "falsified":
-            # 写保护（N130，2026-09-25）：证伪 = 对原节点的一次**硬删除**
-            # （os.remove，无快照、不进 trash），与 forget/降级同受「不可遗忘」
+            # 写保护（N130，2026-09-25）：证伪 = 对原节点的一次**删除**——软删
+            # （进 trash/ + 写删除清单，restore(node_id, force=True) 可复原），
+            # 与 forget/降级同受「不可遗忘」
             # 保护——self/anchor 层、protected 标记、importance≥0.7 不得被一次
             # verify 调用一键删除。对照 forget 路径（mdcos.py forget）同一闸口：
             # 受保护节点需显式 override=True（旧版本先快照进 _protected_history
@@ -5714,25 +5758,40 @@ class MdCG:
                         "new_id": None, "evidence_count": None,
                         "demoted": None}
             # 移入 rejected：负记忆化
+            # issue #214（同根出口）：证伪存根取**原节点 frontmatter 的密级**。
+            # 不传 ⇒ 按 internal 明文落盘：一个 private 节点被证伪后，其正文前
+            # 200 字反而变成 internal 明文——「删掉的比留下的更泄露」。
+            # （#144 收口时曾列为未纳入的改进项。）
             self.add_rejected(hypothesis=node["content"][:200],
                               reason=evidence,
-                              verification_basis="test")
-            # 从原位置**可恢复地**摘除（节点进入 rejected 层）。修前是裸
-            # `os.remove`——一次误判的 verify 即永久丢节点；现先搬进回收站
-            # （有 `trash_dir` 的载体用它，纯 `MdCG` 用 `<root>/_falsified_trash`），
-            # 搬不动才退回 os.remove（保留旧行为作最后手段，不因回收站不可用
-            # 卡死裁决）。落点可由 `restore(node_id)` 取回。
-            _dst = self._retire_path(node_id)
-            _moved = False
-            if _dst is not None:
-                try:
-                    publish(_src, _dst)
-                    _moved = True
-                except OSError:
-                    _moved = False
-            if not _moved:
-                os.remove(_src)
-            self._unstage(node_id)      # 同上：索引删除必须可重放（防幽灵条目）
+                              verification_basis="test",
+                              sensitivity=(node.get("frontmatter") or {})
+                              .get("sensitivity"))
+            # 从原位置删除（节点进入 rejected 层）——**走软删单点**，与 forget
+            # 同一条可恢复路径：MdCGOS._forget_apply（节点文件移入 trash/ +
+            # 写删除清单 + _unstage 摘索引）。此前这里是 os.remove **硬删**
+            # （无快照、不进 trash、restore 恒 not_in_trash）——同一份记忆在
+            # verify 与 forget 两条路径上可恢复性分叉（一次裁决即不可逆丢失）。
+            _sdel = getattr(self, "_forget_apply", None)
+            if _sdel is not None:
+                _sdel(node_id, self.index["nodes"].get(node_id) or node, evidence)
+            else:
+                # 纯 MdCG（未挂载 mdcos 的 OS 软删面）**不得硬删**：就地按同一
+                # 口径兜底——同一 trash/ 布局、同一删除清单、同一摘索引收尾
+                # （不是第二套判据；宁可不删也不丢数据，绝不退化成硬删）。
+                _tdir = os.path.join(self.root, "trash")
+                os.makedirs(_tdir, exist_ok=True)
+                _dst = os.path.join(_tdir, "%s.md" % node_id)
+                os.replace(os.path.join(self.root, node["path"]), _dst)
+                append_jsonl(os.path.join(self.root, "_deletions.jsonl"),
+                             {"t": time.time(), "id": node_id,
+                              "hash": hashlib.sha256(
+                                  (node.get("content") or "").encode("utf-8")
+                              ).hexdigest()[:16],
+                              "reason": evidence, "actor": None,
+                              "trash": os.path.relpath(_dst, self.root)
+                                       .replace(os.sep, "/")})
+                self._unstage(node_id)
             trust.invalidate_cache(self)        # 索引已变 → 反查索引作废
             # 地基塌了：直接下游立即标存疑（**同步一跳**，永不抛、不阻断本次裁决）
             propagation = trust.mark_dependents(
@@ -5857,7 +5916,7 @@ class MdCG:
     def record_access(self, node_ids, tier=None):
         try:
             append_jsonl(self.access_log,
-                         {"t": time.time(), "ids": list(node_ids), "tier": tier})
+                         {"t": time.time(), "ids": _ensure_list(node_ids), "tier": tier})
         except OSError:
             pass
 

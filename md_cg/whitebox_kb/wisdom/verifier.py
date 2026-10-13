@@ -181,7 +181,11 @@ class VerifyResult:
 # v6（2026-08-31）：cases 形态修复（list→tuple）后指纹归一化同值，旧 False
 # 条目对修复免疫；bump 版本作废全部旧缓存——长驻进程内存快照复活毒条目的
 # 终局解（版本不符整体清空，任何进程加载即重建）。
-VERIFIER_VERSION = 11  # v11（issue #91 根因③）：L2/L3/集成三处执行一律改走**受控
+VERIFIER_VERSION = 12  # v12（issue #185 附带发现）：白名单补 `__build_class__`、
+                       # 命名空间补模块级 `__name__`（Py3 `class` 语句的两处必需
+                       # 依赖）——L2/L3 的执行环境因此改变，旧缓存（含「__build_class__
+                       # not found」时代的失败条目）不可信，bump 作废（同 v11 口径）。
+                       # v11（issue #91 根因③）：L2/L3/集成三处执行一律改走**受控
                        # 时限子进程**（超时 fail-closed，不再可能永久挂死）；判据面
                        # 变更（执行环境与用例过境编码）故 bump 作废旧缓存。v10：结构规范的字面匹配改大小写不敏感——该表是语言无关的
                        # 任务语义判据（要求去重结构出现），字面取自 Python 命名习惯
@@ -234,6 +238,15 @@ def _table_payload_chars() -> int:
 # 就已执行（实测 open() 载荷：ok=False 但副作用文件已创建）。
 # 本白名单保留常用纯函数与异常类型，**去掉** open / __import__ / eval / exec / compile /
 # globals / locals / vars / dir / input / breakpoint —— 即「能算出答案，但碰不到外面」。
+#
+# issue #185 附带发现（2026-10-09 DSH 端）：上面这份白名单缺 `__build_class__` ⇒ Py3 里
+# 一切含 `class` 的被测代码都在 L2 样例以「__build_class__ not found」判负（本批递归
+# 发现新收进门的三个生态测试，其红由此第一次暴露）。
+# 为何补它：`class` 语句先向 builtins 取 `__build_class__`，再由它执行类体；类体头两条
+# 指令是 `LOAD_NAME __name__` → `STORE_NAME __module__`，故受限命名空间还须给一个
+# 模块级 `__name__`（纯字符串全局；见下方 `_safe_builtins()`/SAFE_NS() 与子进程执行器）。
+# 安全边界：`__build_class__` 只是「定义类」的定义钩子，不提供文件/网络/进程能力；
+# 上面明令去掉的 open / __import__ / eval / exec / compile 等**不得**因此被放开。
 # 无超时（#91 根因③）已由本文件同批的「受控时限子进程」补齐——见下方 EXEC_TIMEOUT_S 段；
 # 该白名单被**父侧 SAFE_NS() 与子进程侧 `_EXEC_RUNNER_SRC` 共用同一份**（单一真源）。
 import builtins as _bi
@@ -244,16 +257,130 @@ _SAFE_BUILTIN_NAMES = (
     "list", "map", "max", "min", "next", "object", "ord",
     "pow", "print", "range", "repr", "reversed", "round",
     "set", "slice", "sorted", "str", "sum", "tuple", "type", "zip",
+    "__build_class__",
     "Exception", "ValueError", "TypeError", "KeyError",
     "IndexError", "ZeroDivisionError", "StopIteration",
     "ArithmeticError", "AttributeError", "AssertionError",
     "NotImplementedError", "RuntimeError", "True", "False", "None")
 
 
+_SAFE_MODULE_NAME = "__mdcg_verify__"
+# ↑ 执行命名空间的**模块级** `__name__`：class 体的 `LOAD_NAME __name__` 需要它。
+#   它是纯字符串全局，**不是** builtin —— builtins 白名单边界不因此放宽。
+
+
+# ============ 纯计算模块白名单 + 受控 __import__（issue #187） ============
+# 背景：白箱单元模板里存在 `import re as _re` 这类**纯计算**标准库导入；#185 把
+# `__import__` 从 builtins 白名单里去掉（当时是正确的加固），于是 import 语句在
+# 受限命名空间里一律 `ImportError: __import__ not found`（实测：
+# "✗ L2样例 样例1 崩溃: … → __import__ not found"）。
+#
+# 本块**不是**放开危险能力——只放行「纯计算模块白名单」：
+#   re（正则）/ math（数学）/ json（内存内序列化）/ itertools / functools /
+#   collections / decimal / fractions / statistics / string / heapq / bisect /
+#   typing / dataclasses / abc
+# 逐项理由：它们都只在**内存里算**，不提供文件（open / os.path / io / shutil /
+# pathlib / tempfile）、网络（socket / http / urllib / ftplib）、进程（subprocess /
+# os.system / ctypes / multiprocessing）、动态导入（importlib / runpy / builtins）
+# 能力——危险能力**仍不可用**。该白名单是既有 L1 静态门 `_STDLIB_OK` 的子集
+# （运行时允许的 ⊂ 静态允许的），不引入 L1 之外的新面。
+#
+# 边界（逐条）：白名单外一律抛 ImportError（**不**静默回落到真 `__import__`）；
+# os / sys / subprocess / builtins / importlib / ctypes / socket / shutil /
+# pathlib / io / pickle 等逃逸路径由 `_SAFE_IMPORT_DENY` 显式拦截，并在守卫里
+# 逐项断言。
+# 取道（`__import__("re").__builtins__`）：**真模块的 globals 里确实带
+# `__builtins__``（那是一条逃逸取道），故这里返回的**不是**裸 module 对象，而是
+# `_SafeModule` 代理——只暴露公开属性，一切 `_` 开头（含 `__builtins__` /
+# `__globals__` / `__dict__`）的名字一律 AttributeError。
+# 残留诚实声明：Python 进程内命名空间无法阻断基于 `object.__subclasses__()` 的
+# 反射取道（`object` / `type` / `getattr` 本就在 #185 白名单内，与本笔无关）；那
+# 一层由「受控时限子进程」（#91）的进程/时间边界负责，不靠本白名单兜底。
+_SAFE_MODULE_WHITELIST = (
+    "re", "math", "json", "itertools", "functools", "collections",
+    "decimal", "fractions", "statistics", "string", "heapq", "bisect",
+    "typing", "dataclasses", "abc")
+
+#: 显式拦截清单（白名单外必然 ImportError；列表化是为了让守卫能逐项断言边界）。
+_SAFE_IMPORT_DENY = (
+    "os", "sys", "subprocess", "builtins", "importlib", "ctypes", "socket",
+    "shutil", "pathlib", "io", "pickle", "marshal", "tempfile", "threading",
+    "multiprocessing", "signal", "gc", "inspect", "code", "codeop", "runpy",
+    "site", "pkgutil", "platform", "posix", "nt", "_thread")
+
+#: 包装对象上**禁止**出现的属性名（逃逸取道：module.__builtins__ 等）。
+_MODULE_BLOCKED_ATTRS = frozenset((
+    "__builtins__", "__loader__", "__spec__", "__dict__", "__globals__",
+    "__class__", "__subclasses__", "__bases__", "__mro__", "__reduce__",
+    "__reduce_ex__", "__getattribute__"))
+
+
+class _SafeModule:
+    """受限模块代理：只暴露（白名单模块的）公开属性。
+
+    `__builtins__` / `__globals__` / `__dict__` 等取道一律 AttributeError——
+    `re.search` 这类**纯计算**用法不受影响，逃逸取道全部堵死。
+    """
+
+    __slots__ = ("_m", "_n")
+
+    def __init__(self, mod, name):
+        object.__setattr__(self, "_m", mod)
+        object.__setattr__(self, "_n", name)
+
+    def __getattribute__(self, attr):
+        if attr.startswith("_") or attr in _MODULE_BLOCKED_ATTRS:
+            raise AttributeError("受限模块代理不暴露 %r" % (attr,))
+        return object.__getattribute__(self, attr)
+
+    def __getattr__(self, attr):
+        if attr.startswith("_") or attr in _MODULE_BLOCKED_ATTRS:
+            raise AttributeError("受限模块代理不暴露 %r" % (attr,))
+        return getattr(object.__getattribute__(self, "_m"), attr)
+
+    def __repr__(self):
+        return "<受限模块 %s>" % (object.__getattribute__(self, "_n"),)
+
+
+def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """受控 `__import__`：仅纯计算模块白名单，其余一律 ImportError。
+
+    签名与内建 `__import__` 一致（import 语句按 5 参调用）。相对导入直接拒——
+    受限命名空间里没有包上下文。
+    """
+    if level:
+        raise ImportError("受限执行环境不支持相对导入（level=%r）" % (level,))
+    top = str(name).split(".")[0]
+    if top in _SAFE_IMPORT_DENY or top not in _SAFE_MODULE_WHITELIST:
+        raise ImportError("受限执行环境禁止导入 %r（仅允许纯计算模块白名单: %s）"
+                          % (name, ", ".join(_SAFE_MODULE_WHITELIST)))
+    return _SafeModule(_bi.__import__(name, globals, locals, fromlist, level), top)
+
+
+def _safe_builtins() -> Dict[str, Any]:
+    """受限 builtins 白名单映射——**单一真源**（父侧 SAFE_NS() 与子进程执行器同用一份）。
+
+    安全边界（issue #185）：本映射只提供「算得出答案」的纯函数与异常类型。
+    `__build_class__` 仅是 `class` 语句的**定义钩子**——CPython 在类体执行前由
+    builtins 查表调用它，它不提供文件/网络/进程能力。危险能力（open /
+    eval / exec / compile / globals / locals / vars / dir / input /
+    breakpoint）**一律不在**本映射内，且不得因本项而放开。
+    issue #187：`__import__` 由本函数**受控**注入（`_guarded_import`）——仅
+    纯计算模块白名单，白名单外一律 ImportError，且返回受限代理而非裸 module；
+    文件/网络/进程/动态导入能力**仍不可用**，真内置 `__import__` 仍不可达。
+    """
+    d = {k: getattr(_bi, k) for k in _SAFE_BUILTIN_NAMES if hasattr(_bi, k)}
+    # issue #187：受控 `__import__`（纯计算模块白名单，见上方 `_guarded_import`）。
+    # 它**不进** `_SAFE_BUILTIN_NAMES`——子进程执行器按该元组逐个 `getattr(_bi, k)`
+    # 重建白名单，把 `__import__` 放进元组会让子进程拿到**真内置**（边界失效）；
+    # 故父侧与子进程侧各自显式注入受控包装。
+    d["__import__"] = _guarded_import
+    return d
+
+
 def SAFE_NS() -> Dict[str, Any]:
-    """被校验代码的执行命名空间：仅暴露 SAFE_BUILTIN_NAMES 内的内建。"""
-    _b = {k: getattr(_bi, k) for k in _SAFE_BUILTIN_NAMES if hasattr(_bi, k)}
-    return {"__builtins__": _b}
+    """被校验代码的执行命名空间：受限 builtins + 模块级 `__name__`（class 体需要）。"""
+    return {"__builtins__": _safe_builtins(), "__name__": _SAFE_MODULE_NAME}
 
 
 # 白箱被校验代码允许导入的标准库（其余一律 L1 拒——见 `_check_l1_syntax`）。
@@ -364,11 +491,55 @@ import sys
 import types
 
 _SAFE_NAMES = __SAFE_BUILTIN_NAMES__
+_SAFE_MODS = __SAFE_MODULE_WHITELIST__
+_DENY_MODS = __SAFE_IMPORT_DENY__
+
+
+class _SafeModule:
+    """受限模块代理：只暴露公开属性；`__builtins__` 等取道一律 AttributeError。"""
+
+    __slots__ = ("_m", "_n")
+
+    def __init__(self, mod, name):
+        object.__setattr__(self, "_m", mod)
+        object.__setattr__(self, "_n", name)
+
+    def __getattribute__(self, attr):
+        if attr.startswith("_") or attr in _BLOCKED_ATTRS:
+            raise AttributeError("受限模块代理不暴露 %r" % (attr,))
+        return object.__getattribute__(self, attr)
+
+    def __getattr__(self, attr):
+        if attr.startswith("_") or attr in _BLOCKED_ATTRS:
+            raise AttributeError("受限模块代理不暴露 %r" % (attr,))
+        return getattr(object.__getattribute__(self, "_m"), attr)
+
+    def __repr__(self):
+        return "<受限模块 %s>" % (object.__getattribute__(self, "_n"),)
+
+
+_BLOCKED_ATTRS = frozenset((
+    "__builtins__", "__loader__", "__spec__", "__dict__", "__globals__",
+    "__class__", "__subclasses__", "__bases__", "__mro__", "__reduce__",
+    "__reduce_ex__", "__getattribute__"))
+
+
+def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """受控 `__import__`：仅纯计算模块白名单，其余一律 ImportError。"""
+    if level:
+        raise ImportError("受限执行环境不支持相对导入（level=%r）" % (level,))
+    top = str(name).split(".")[0]
+    if top in _DENY_MODS or top not in _SAFE_MODS:
+        raise ImportError("受限执行环境禁止导入 %r（仅纯计算模块白名单）" % (name,))
+    return _SafeModule(_bi.__import__(name, globals, locals, fromlist, level), top)
 
 
 def _safe_builtins():
     # 与父侧 SAFE_NS() 的**同一份**白名单
-    return {k: getattr(_bi, k) for k in _SAFE_NAMES if hasattr(_bi, k)}
+    d = {k: getattr(_bi, k) for k in _SAFE_NAMES if hasattr(_bi, k)}
+    # issue #187：与父侧同款受控 `__import__`（纯计算模块白名单）。
+    d["__import__"] = _guarded_import
+    return d
 
 
 def _dec(n):
@@ -429,7 +600,7 @@ def main():
         out["exec_err"] = str(e)
         dump()
         return
-    ns = {"__builtins__": _safe_builtins()}
+    ns = {"__builtins__": _safe_builtins(), "__name__": "__mdcg_verify__"}
     try:
         exec(compile(p["code"], "<verify>", "exec"), ns)
     except Exception as e:
@@ -479,7 +650,9 @@ def main():
 
 
 main()
-'''.replace("__SAFE_BUILTIN_NAMES__", repr(tuple(_SAFE_BUILTIN_NAMES)))
+'''.replace("__SAFE_BUILTIN_NAMES__", repr(tuple(_SAFE_BUILTIN_NAMES))).replace(
+    "__SAFE_MODULE_WHITELIST__", repr(tuple(_SAFE_MODULE_WHITELIST))).replace(
+    "__SAFE_IMPORT_DENY__", repr(tuple(_SAFE_IMPORT_DENY)))
 
 
 def _first_func_info(code: str) -> Tuple[Optional[str], Optional[int],

@@ -67,6 +67,9 @@ _FIX_RE = re.compile(
     re.I | re.M)
 
 RRF_K = 60          # RRF 常数
+# 每路能贡献多少候选（融合循环里的 `[:cap]` 截断）——**单一真源**（issue #139 R-2）：
+# `md_cg.bm25.LIMIT` 与 search_rrf 的融合 / 仅召回两处切片都引用本常量。
+RRF_PATH_TERM_CAP = 50
 
 # ---- issue #130：实体路（`_path_entity`）的**有判别力**打分 -------------------
 # 缺陷现场：原实现命中即 `out.append((node, 1.0))`——全路同分，其"排序"只由
@@ -76,6 +79,15 @@ RRF_K = 60          # RRF 常数
 # 按覆盖长度分级 > query 是 tag 的子串），多 tag 命中轻微累加。分数只用于**本路
 # 内部排序**（融合层只吃名次），故取相对量级即可，无需归一。
 TAG_AFFINITY_EXTRA = 0.05   # 第 2 个及以后命中 tag 的累加步长（防条数支配排序）
+
+# issue #130 追评：**名次不可信路**名单——这些路的分数是粗粒度、块内大量
+# 并列的匹配强度（entity 的 tag 亲和 `_tag_affinity`），其「名次」只由
+# `(-score, -importance, id)` 兜底键（写入序）决定、不携带相关性。它们只要
+# 出现同分块（同一分数出现 >= 2 次）就整路弃权投票（退回 recall_only 语义：
+# 只补候选池、不改排序），避免以写入序冒充名次（issue #130 实测：关掉实体路
+# 即从第 50 位精确复原到第 26 位）。按真实打分排序的路（lexical/bm25/fuzzy）
+# 不在名单内，行为逐位不变。
+_RANK_ABSTAIN_PATHS = ("entity",)
 
 
 def _tag_affinity(tags, query: str) -> float:
@@ -123,6 +135,47 @@ TEMPORAL_DT_UNIT = "day"
 #: created_at 的节点**仍带非零分进入本路，而不是被乘成 0 后不可召回
 #:（读数见 `md_cg/test_time_core_lint.py` 的 G4 floor 组）。
 TEMPORAL_SCORE_FLOOR = 0.001
+
+#: 各路分数的**下限哨兵**：该路打分函数的下界。缺声明 ⇒ 本路不做 floor 判据。
+#: 新增路只需在此登记其下限（若确有下限），判据即自动覆盖——不再需要维护路名名单。
+#: 与 _RANK_ABSTAIN_PATHS 的本质区别：名单漏登记 ⇒ 该路**同族病理整体逃逸**；
+#: 下限漏登记 ⇒ 只少一条判据，whole_tie 仍在，**不会误伤**（fail-safe 方向相反）。
+PATH_SCORE_FLOORS = {"temporal": TEMPORAL_SCORE_FLOOR}
+
+
+# 生效条件：scores 为**已按 (-score,-importance,id) 排好序**的本路分数序列（float 列表）；
+# name 为该路名；floors 缺省取 PATH_SCORE_FLOORS。返回 None = 名次可信，否则返回
+# 不可信的理由串（"whole_tie" / "floor_mass"）。
+# 不适用条件：不判「分数是否有意义」（那需要 ground truth）；只判「名次是否由分数
+# 决定」——即「同分块内部的相对名次是否只由兜底键（id）决定」。纯函数、零 IO、
+# 零依赖、零训练、可复算（只读该路自己的分数序列）。
+def rank_credibility(name, scores, floors=None):
+    """该路本轮的名次是否可信（issue #197 / #205，与路名无关的性质判据）。
+
+    动机（issue #130 追评的残留）：原判据是**硬编码路名名单**
+    _RANK_ABSTAIN_PATHS = ("entity",)——用「路名」表达「名次不可信」这条
+    **性质**，于是 ① 同一文件 :1966 的注释自认 temporal 同病、名单却没它，
+    该路仍以全权重投票；② 新增检索路不会自动纳入（漏报风险）。
+
+    本判据锚定**机制**而非**表象**（#205 §1.1）：
+      · whole_tie：整路一个分数 ⇒ 路内序 = 兜底键序，名次零信息；
+      · floor_mass：该路声明的分数下限被 **>=2 个**候选取到 ⇒ 该块内分数不可分辨
+        （temporal 的退化形态：cred_factor 在 Δt 远大于 10 个半衰期后把分数夹在
+        TEMPORAL_SCORE_FLOOR 上，块内年龄信息被**完全擦除**）。
+    **不**把「存在同分块」当作不可信：lexical / chain / graph 也都含同分块
+    且它们是健康的（#205 §1.2(d) 实测：_has_block 型判据把 MRR 从 0.3469 打到
+    0.1306，-62%）——判据必须锚定「信息被擦除」这一机制，而不是「存在并列」。
+
+    阈值取 >= 2（1 个下限候选时其名次由它相对其余候选的分数唯一决定，无歧义）。
+    """
+    if not scores:
+        return None
+    if len(set(scores)) == 1:
+        return "whole_tie"          # 全路一个分数 ⇒ 路内序 = 兜底键序
+    fl = (floors if floors is not None else PATH_SCORE_FLOORS).get(name)
+    if fl is not None and sum(1 for s in scores if s == fl) >= 2:
+        return "floor_mass"         # 下限被夹住 ⇒ 该块内分数不可分辨
+    return None
 
 
 # ==========================================================================
@@ -230,6 +283,10 @@ def excerpt_tokens(text: str, max_tokens: int) -> str:
 # 生效条件：text 为可调用 .strip().encode("utf-8") 的字符串时，返回 hashlib.sha1(text.strip().encode("utf-8")).hexdigest()[:n]，n 默认 12 只决定摘要截取长度。
 def _sig(text: str, n: int = 12) -> str:
     return hashlib.sha1(text.strip().encode("utf-8")).hexdigest()[:n]
+
+
+# 公开别名：供 hive 侧引用，勿再直接引用私有名
+sig = _sig
 
 
 _SUBSTRING_CACHE_MAX_TERM = 64
@@ -659,6 +716,31 @@ def _read_foreign_sampled(cg):
     if rate <= 0:
         return False
     return rate == 1 or cg._read_foreign_seen % rate == 0
+
+
+# ---- issue #172（P1，路径穿越）：restore() 入口 node_id 校验单点（先拦后读）----
+# 病象：restore() 曾对 node_id 零校验直接拼路径 os.path.join(self.trash_dir,
+#       f"{node_id}.md")——`../secret` 拼出 trash 之外的路径，os.path.exists
+#       通过后文件**被打开读取**，直到 self.add() 的 P0-1 白名单才拦下（先读后拦）。
+# 处置：判据收口到本单点，restore 入口**先拦后读**——非法即返回：不读 deletions_log、
+#       不 os.path.exists、不 open。判据与 add() 的 P0-1 白名单**同源**：同一
+#       _NODE_ID_RE + 同一 '..' 禁令 + 同一类型/长度闸 + 同一 _NODE_ID_FORBIDDEN。
+# 白名单字符类不含 斜杠/反斜杠/冒号/百分号，'..' 另判：`../`、绝对路径、盘符、
+#       `..` 加反斜杠、URL 编码形态（%2e%2e%2f / ..%2f）一律拒；
+# 合法 id（字母数字 _ . @ - 与 中文 与 逗号）行为不变。
+def _restore_id_ok(node_id) -> bool:
+    """node_id 是否可进入 restore 的落盘路径拼接（fail-closed，判据同 add）。"""
+    from .mdcg import _NODE_ID_RE, _NODE_ID_FORBIDDEN
+    if not isinstance(node_id, str):
+        return False
+    if not node_id or len(node_id) > 128 or ".." in node_id:
+        return False
+    if node_id in _NODE_ID_FORBIDDEN:
+        return False
+    return bool(_NODE_ID_RE.match(node_id))
+
+
+
 
 
 # 生效条件：以任意 root 构造时按其拼接 audit_log/hippocampus/trash 等路径并 makedirs 创建 hippocampus 与 trash_dir（exist_ok=True），autoflush 透传父类、actor 存入 self.actor；
@@ -1905,6 +1987,7 @@ class MdCGOS(MdCG):
         per_path = {}
         ro = set(recall_only or ())
         no_rank_signal = []          # 名次不可信的路（分数无判别力，见循环内判据）
+        _cred_detail = {}            # issue #197：性质判据的逐路理由（仅开关开时填充）
         # 契约的**生效条件**：只在「多路竞争」时启用（≥2 路实际产出候选）。
         # 单路时该路的名次就是唯一排序依据——没有别的路会被它挤掉，此时
         # `(-score, -importance, id)` 兜底序是**既有契约**：守卫
@@ -1929,12 +2012,34 @@ class MdCGOS(MdCG):
             # 契约：这类路**本轮不参与打分**，退回 recall_only 语义（只补候选池、
             # 不改排序），并在 meta.no_rank_signal / path_fingerprint 留痕可审计。
             _scores = [float(_s) for _n, _s in scored]
-            if _gate_on and len(_scores) >= 2 and len(set(_scores)) == 1:
+            # issue #130 追评：仅「整路同分」拦不住实体路——只要有一个离群分数
+            # （如某节点多命中一个 tag -> `_tag_affinity` 给 base+0.05）就把 set
+            # 撑到 >=2，门失效，整路仍按写入序 w/(K+rank) 全额投票，同分块内部的
+            # 写入序照样冒充名次（实测真命中被压 24 位：26 -> 50）。
+            # 故对**名次不可信路**（`_RANK_ABSTAIN_PATHS`：分数是粗粒度 tag 亲和、
+            # 块内大量并列者）加严：只要出现**同分块**（同一分数出现 >=2 次）即整路
+            # 弃权投票（退回 recall_only 语义：只补候选池、不改排序），可审计留痕于
+            # meta.no_rank_signal。按真实打分排序的路（lexical 等）**逐位不变**。
+            _whole_tie = len(set(_scores)) == 1
+            _has_block = len(set(_scores)) < len(_scores)
+            # issue #197 / #205：**与路名无关的性质判据**（缺省关）。开关关时
+            # _cred 恒 None、rank_credibility 一次都不被调用 ⇒ 门与 HEAD
+            # 逐位相同（_RANK_ABSTAIN_PATHS 分支原文保留，两条判据**并存**：
+            # 名单管「已知同族」、新判据管「按性质可判」，是刻意的冗余）。
+            _cred = None
+            if os.environ.get("MDCG_RANK_CREDIBILITY") == "1" and len(_scores) >= 2:
+                _cred = rank_credibility(name, _scores)
+                if _cred is not None:
+                    _cred_detail[name] = _cred
+            if _gate_on and len(_scores) >= 2 and (
+                    _whole_tie
+                    or (_has_block and name in _RANK_ABSTAIN_PATHS)
+                    or _cred is not None):
                 no_rank_signal.append(name)
                 ro.add(name)
                 continue
             w = float((path_weights or {}).get(name, 1.0))
-            for rank, (node, _s) in enumerate(scored[:50], 1):
+            for rank, (node, _s) in enumerate(scored[:RRF_PATH_TERM_CAP], 1):
                 nid = node["id"]
                 contrib = w / (RRF_K + rank)
                 if fusion == "max":
@@ -1947,7 +2052,7 @@ class MdCGOS(MdCG):
                     entry["conditions"] = chain_prov[nid]["conditions"]
                 prov.setdefault(nid, []).append(entry)
         for name in ro:                     # 仅召回：补候选，不改排序
-            for rank, (node, _s) in enumerate((ranked.get(name) or [])[:50], 1):
+            for rank, (node, _s) in enumerate((ranked.get(name) or [])[:RRF_PATH_TERM_CAP], 1):
                 nid = node["id"]
                 if nid in rrf:
                     continue
@@ -2068,6 +2173,10 @@ class MdCGOS(MdCG):
             "multi": sum(1 for _lst in prov.values()
                          if len({p.get("path") for p in _lst}) >= 2),
             "provenance": prov}
+        # issue #197：逐路理由**仅在开关开时**落键——否则 path_fingerprint.hash
+        # 会变，破坏「关闭时逐位不变」。
+        _cred_meta = ({"rank_credibility": dict(sorted(_cred_detail.items()))}
+                      if _cred_detail else {})
         _fp_selection = {
             "scanned": stat["scanned"],
             "gates": sorted((gates or {}).keys()) or None,
@@ -2075,10 +2184,20 @@ class MdCGOS(MdCG):
             "judge_ranking": bool(judge and judge_ranking),
             "judge_filtered": filtered,
             "early_stopped": early_stopped,
-            "no_rank_signal": sorted(no_rank_signal)}
+            "no_rank_signal": sorted(no_rank_signal), **_cred_meta}
         _path_fp = build_path_fingerprint(selection=_fp_selection,
                                           recursion=_fp_recursion,
                                           paths=_fp_paths)
+        # issue #139 R-2 审计（**只增不改**，先例 path_fingerprint）：把「每路能贡献
+        # 多少候选」的单一真源显式报账——candidates=本路产出候选总数（与 meta.paths
+        # 同源）、used=实际进入融合的名额（= min(candidates, RRF_PATH_TERM_CAP)，即融合
+        # / 仅召回两处切片的长度）、dropped=被 cap 挡在融合之外的候选数。纯聚合读数：
+        # 不改任何既有键，也不改 meta.paths 的值类型（仍是 int）。
+        path_truncation = {
+            name: {"candidates": int(n),
+                   "used": int(min(n, RRF_PATH_TERM_CAP)),
+                   "dropped": int(max(0, n - RRF_PATH_TERM_CAP))}
+            for name, n in per_path.items()}
         if record and results:
             self.record_access([r[0]["id"] for r in results], "RRF")
         # 热路径：写 query 结果缓存 —— **同样受 `_time_on` 约束**。
@@ -2091,10 +2210,11 @@ class MdCGOS(MdCG):
                          "judge_ranking": bool(judge and judge_ranking),
                          "judge_filtered": filtered,
                          "early_stopped": early_stopped,
-                         "no_rank_signal": sorted(no_rank_signal),
+                         "no_rank_signal": sorted(no_rank_signal), **_cred_meta,
                          "expand_source": fuzzy_source,
                          "goal_used": goal_used,
                          "provenance": prov,
+                         "path_truncation": path_truncation,
                          "path_fingerprint": _path_fp, **_tf_meta,
                          **_gates_meta, **_bnd_meta, **_index_meta}, k=k, layer=layer,
                          session=session, branch=branch, validity=validity,
@@ -2104,10 +2224,11 @@ class MdCGOS(MdCG):
                          "judge_ranking": bool(judge and judge_ranking),
                          "judge_filtered": filtered,
                          "early_stopped": early_stopped,
-                         "no_rank_signal": sorted(no_rank_signal),
+                         "no_rank_signal": sorted(no_rank_signal), **_cred_meta,
                          "expand_source": fuzzy_source,
                          "goal_used": goal_used,
                          "provenance": prov,
+                         "path_truncation": path_truncation,
                          "path_fingerprint": _path_fp, **_tf_meta,
                          **_gates_meta, **_bnd_meta, **_index_meta}
 
@@ -3105,6 +3226,34 @@ class MdCGOS(MdCG):
                 tags = list(edits.get("tags", tags))
                 layer = edits.get("layer", layer)
             extra = dict(item.get("extra") or {})
+            # issue #186（C 兜底）：以提案记录**顶层** rec["sensitivity"] 兜底
+            # （extra 有则用 extra，没有则回落顶层）——即使将来某个入队点漏把密级
+            # 放进 extra，accept 也不会把已记录在提案顶层的密级丢掉（顶层 sensitivity
+            # 由 propose 恒落，见 rec["sensitivity"]）。
+            if extra.get("sensitivity") is None and item.get("sensitivity"):
+                extra["sensitivity"] = item["sensitivity"]
+            # session **不是**声明透传要素，而是**归因维**（同 writer / reviewer）：
+            # 2026-10-07 三态裁定——accept 落盘的会话归属一律取**裁决者**面
+            # （显式 --session > 环境 MDCG_SESSION > unattributed），**不得**被提案里
+            # 写入者的会话覆盖。故此处主动丢弃 extra 里的 session（提案侧写入者的
+            # 会话仍完整保留在 inbox 记录的 rec["session"] 上，可追溯），让 add 的
+            # _eff_session 走裁决者单点。issue #186 修复一度把 session 与 sensitivity
+            # 同等当作「声明透传要素」回落顶层，导致 review_cli 的 --session 失效
+            # （md_cg/test_review_cli_attribution.py ①④⑤⑥ 转红）——两者语义不同，
+            # 不可同法处置。
+            # 取值序（2026-10-07 三态裁定的完整落地，本仓两条既有判据的交集）：
+            #   ① 裁决者的**有效会话**（_attribution_session_of：env / 显式 --session /
+            #      库层显式构造）非 unattributed ⇒ 用它（md_cg/test_review_cli_attribution ①④⑤）；
+            # session **不做任何兜底**：extra["session"] 就是提案侧**显式声明**的
+            # 会话（_proposal_extras 的 a.get("session")；未声明则该键值为 None、
+            # 在 _proposal_extras 里被过滤掉、不落键）。三条既有判据的交集唯此一解：
+            #   · 声明了 ⇒ 经 **extra 透传落盘（test_session_attribution_consistency
+            #     B10：rec.session == fm.session == add 审计）；
+            #   · 未声明 ⇒ extra 无此键，落盘走 add 的归因单点（裁决者面：env /
+            #     显式 --session / unattributed）——这正是 review_cli ①④⑤⑥ 的判据；
+            #   · **不得**用 inbox 记录顶层 rec["session"] 兜底：那是**写入者**面
+            #     （principal 显式构造），兜底会让「裁决者两者皆缺省」时冒出写入者的
+            #     会话（review_cli ⑥ 必须落 unattributed）。
             if item.get("verify"):
                 extra["verify"] = item["verify"]
                 extra["verify_hash"] = expect
@@ -3349,6 +3498,15 @@ class MdCGOS(MdCG):
                                           "actor": self.actor,
                                           "trash": os.path.relpath(dst, self.root)
                                                    .replace("\\", "/")})
+        # issue143-FIX(item3)：软删也进遗忘审计——forget 是唯一不可逆动作，此前
+        # 只写 _deletions.jsonl，_forgetting.jsonl 零增长（docstring 承诺「一切裁决
+        # 都写进 _forgetting.jsonl」未兑现）。新增第五态 verdict="FORGET"，summary()
+        # 的 by_verdict 为任意键计数，无需改动；既有行形状不变。
+        forgetting.log(self, {"t": time.time(), "node_id": node_id,
+                              "layer": e.get("layer"),
+                              "verdict": "FORGET", "reason": reason,
+                              "actor": self.actor, "tombstone": h,
+                              "ledger": "_deletions.jsonl"})
         # 摘索引必须**落盘**（写删除记录）：只 pop 内存会让条目在下次启动
         # 重放 _index_log 时复活成幽灵条目（索引有条目、文件已进 trash/）。
         self._unstage(node_id)
@@ -3452,6 +3610,11 @@ class MdCGOS(MdCG):
 # 生效条件：当 node_id 传入时，若 deletions_log 中存在该 id 且 force=False 返回 tombstoned 拒绝；否则检查 trash_dir/{node_id}.md，os.path.exists 为 False 返回 not_in_trash；node_id 非法（第 5 轮，issue #172：字面闸 + realpath 闸均不过）返回 bad_node_id 且**不读任何文件**；文件含坏字节（非 UTF-8）无法解析时返回 error=corrupt 且 trash 源原样保留（不删不移）；可打开则读取并以 add(override=True) + trash frontmatter 元数据全量透传（显式形参逐项传，其余键经 **extra 回写；lifecycle_state 仅在 active→该态合法迁移时透传）恢复、移除 trash 源、audit，返回 ok True/id/forced=bool(force)；
     def restore(self, node_id: str, force: bool = False):
         """恢复：若在删除清单中且未 force → 拒绝（恢复时删除检查）。"""
+        # issue #172（P1，路径穿越）：入口**先拦后读**——node_id 非法即返回，
+        # **不触碰文件系统**（不读 deletions_log、不 os.path.exists、不 open）。
+        # 合法 id 行为不变；判据单点见模块级 _restore_id_ok（与 add 的 P0-1 白名单同源）。
+        if not _restore_id_ok(node_id):
+            return {"ok": False, "error": "invalid_id"}
         tomb = [r for r in read_jsonl(self.deletions_log) if r.get("id") == node_id]
         if tomb and not force:
             return {"ok": False, "error": "tombstoned",
@@ -4750,6 +4913,10 @@ class MdCGOS(MdCG):
                                     node_id=node_id)
         v = verdict["verdict"]
         out = {"verdict": v, "node_id": node_id, "gate": verdict}
+        # issue143-FIX(item1)：落盘=裁决值收口到四态分派之前——DEFER 经审查队列
+        # 往返后仍须带裁决真分与来源，不得回落 add 缺省 0.5 / importance_source=None。
+        kw["importance"] = verdict["importance"]["score"]
+        kw["importance_source"] = verdict["importance"]["from"]
         if v == "ACCEPT":
             # issue50-d（2026-10-02）：**落盘=裁决值**。此前「hint 非 None 才
             # 透传」的口径把启发式裁决值全部丢在闸门上——隔离沙箱实证：
