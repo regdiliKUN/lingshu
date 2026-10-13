@@ -341,6 +341,15 @@ ENV_ROWS = [
 # 环境面**分类登记**（只登记「属于环境面」与值域类型；**不登记缺省值**）
 # 字段：(name, kind, repo, domain, notes)
 ENV_CATEGORY_ROWS = [
+# 2026-10-13 补登记（衍生版 lingshu · 十一轮源码优化）：优化引入的 4 个新 env。
+# 同 #120 口径：本表只登记分类与值域类型，**不登记缺省值**（缺省以代码实读为准；
+# 进 ENV_ROWS〔带缺省 + G2 锚点逐位复核〕属后续批次）。
+# 这 4 项是 `scripts/check_config_env_registry.py` 的 C1 缺口——优化只跑了 md_cg 组
+# 套件、漏跑 scripts 组，故登记面滞后于代码读取面；此处补齐使 C1 归零。
+    ('MDCG_DIRSCAN', 'env', 'dsh-memory-main', '开关（"1" 开／其它关）', '目录条目表总开关（md_cg/mdcg.py:2670）；缺省 "1"=开，设 0 整体退回「逐路径 stat/islink」的基线口径'),
+    ('MDCG_DIRSCAN_TTL', 'env', 'dsh-memory-main', '秒（float，非法回落 1.0；0=退回基线）', '目录条目表存活时长（md_cg/mdcg.py:2674）；缺省 1.0，把「外部改写不可见」窗口由进程生命周期收敛到 ≤1s；设 0 即窗口=0（每次 stat）'),
+    ('MDCG_NODE_SIDECAR', 'env', 'dsh-memory-main', '开关（"1" 开／其它关）', '节点旁路缓存开关（md_cg/mdcg.py:4193）；缺省 "1"=开；与 MDCG_READ_CACHE 取合取（读缓存关 ⇒ 本层关）'),
+    ('MDCG_SCAN_WORKERS', 'env', 'dsh-memory-main', '整数（1..32，越界夹取；非法回落 8）', '全库扫描读盘并发度（md_cg/mdcg.py:1335）；缺省 8；文件数 < 64（_SCAN_PARALLEL_MIN）时不启线程池，直接串行'),
 # 2026-10-12 补登记（issue #120）：生产面读取但此前不在登记面内的 22 项。
 # 本表只登记分类与值域类型，**不登记缺省值**（缺省以代码实读为准；
 # 进 ENV_ROWS〔带缺省 + G2 锚点逐位复核〕属后续批次）。
@@ -465,5 +474,5 @@ META = {
     "const_dropped": 12,
     "env_count": 56,
     "env_skipped": 1,
-    "env_category_count": 90,
+    "env_category_count": 94,
 }
