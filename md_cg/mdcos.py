@@ -33,7 +33,10 @@ from .mdcg import (MdCG, expand_query_terms, bigrams, normalize_en, STATE_ACCEPT
                    expand_query_terms_llm, en_zh_bigrams, semantic_on,
                    cut_by_relevance, apply_retrieval_gates, NEG_ROUTE_LAYERS,
                    # P2-3（§5.4）：六要素后两行索引键的召回判据单点（mdcg 侧）
-                   index_key_hits, boundary_mark)
+                   index_key_hits, boundary_mark,
+                   # 第 5 轮（issue #172）：node_id 白名单**复用写面单点**——
+                   # trash 路径构造必须与 add 同一套判据，不另写第二份。
+                   _NODE_ID_RE)
 from . import (nodefile, routing, chain, subgraph, forgetting, protect,
                identity, consistency, metacognition, crypto, sustain,
                self_state, predict, evolution, weights, pooling,
@@ -3316,11 +3319,27 @@ class MdCGOS(MdCG):
 
 # 生效条件：e 为 _forget_qualify 通过后的索引条目时执行既有软删体（os.replace 进 trash_dir、写 deletions_log、_unstage、缓存失效、audit）；publish 抛 OSError 时返回 {"ok": False, "error": 异常字符串}；成功返回 {"ok": True, "id", "tombstone"}；
     def _forget_apply(self, node_id: str, e: dict, reason: str = ""):
-        """软删**执行体**（单点）：与改动前的 `forget` 体逐位一致。"""
-        src = os.path.join(self.root, e["path"])
+        """软删**执行体**（单点）：与改动前的 `forget` 体逐位一致。
+
+        第 5 轮（issue #172）补两处闸——两处路径都不再裸拼：
+          · `src`：改走 `_node_disk_path`（读面 P2-20 的**同一个**单点）——
+            索引被污染（手改 .md 的 `id:`/路径字段）时，`os.replace` 的**源**
+            同样会越界；越界即结构化负路由，不搬任何文件。
+          · `dst`：改走 `_trash_path` 单点——`node_id` 越界时 `os.replace`
+            的**目标**会落在 trash 之外 = 任意路径覆写。
+        """
+        try:
+            src = self._node_disk_path(e)
+        except ValueError as exc:
+            return {"ok": False, "error": "bad_node_path",
+                    "reason": "节点路径越界（P2-20）：%s" % exc}
+        dst = self._trash_path(node_id)
+        if dst is None:
+            return {"ok": False, "error": "bad_node_id",
+                    "reason": "node_id 非法（含路径分隔符/父目录引用/越界）："
+                              "拒绝软删，未移动任何文件"}
         fm, content = self._read(e)
         h = _sig(content or "", 16)
-        dst = os.path.join(self.trash_dir, f"{node_id}.md")
         try:
             publish(src, dst)
         except OSError as exc:
@@ -3389,13 +3408,65 @@ class MdCGOS(MdCG):
         return any(r.get("id") == node_id for r in read_jsonl(self.deletions_log))
 
 # 生效条件：当 node_id 传入时，若 deletions_log 中存在该 id 且 force=False 返回 tombstoned 拒绝；否则检查 trash_dir/{node_id}.md，os.path.exists 为 False 返回 not_in_trash；文件含坏字节（非 UTF-8）无法解析时返回 error=corrupt 且 trash 源原样保留（不删不移）；可打开则读取并以 add(override=True) + trash frontmatter 元数据全量透传（显式形参逐项传，其余键经 **extra 回写；lifecycle_state 仅在 active→该态合法迁移时透传）恢复、移除 trash 源、audit，返回 ok True/id/forced=bool(force)；
+    def _trash_path(self, node_id):
+        """trash 源/目标路径的**唯一构造点**（第 5 轮，issue #172）。
+
+        修前两处各自 `os.path.join(self.trash_dir, f"{node_id}.md")`：
+          · `restore` 的 node_id 是**调用方可控入参**（MCP 工具面直达）；
+          · `forget` 的 node_id 取自索引，而索引 id 直接抄盘上 frontmatter
+            （`_scan_nodes` 只做 str 归一、**不校验形状**）——手改一个 .md
+            的 `id:` 字段即可污染。
+        `os.path.join` 遇到绝对路径会**丢弃前缀**、遇 `..` 会穿越出 trash，
+        于是 restore 面变成「读任意 .md 文件」，forget 面 `os.replace(src,dst)`
+        更是**任意路径覆写**。两处必须同一套判据，故收成一个单点。
+
+        判据两道（与读面 P2-20 同源纪律）：
+          ① **字面闸**：复用写面 `_NODE_ID_RE` + `..` + 长度（与 `add` 同一份
+             正则对象，不另写第二份白名单）；再加 `basename(nid) == nid`
+             一次判完分隔符/父目录引用，以及驱动器号/绝对路径。
+          ② **realpath 闸**：拼出的结果解析后必须落在 trash_dir 之内——兜住
+             符号链接 / junction 形态（trash_dir 本身被换成链接等）。
+
+        任一道不过返回 None；调用方**不构造路径、不读写、不删除**。
+        """
+        nid = node_id if isinstance(node_id, str) else ""
+        if not nid or len(nid) > 128 or ".." in nid:
+            return None
+        if not _NODE_ID_RE.match(nid):
+            return None
+        # 分隔符/父目录引用一次判完；`os.path.basename` 在两种分隔符下都成立
+        if nid != os.path.basename(nid) or "\\" in nid or "/" in nid:
+            return None
+        if os.path.isabs(nid) or os.path.splitdrive(nid)[0]:
+            return None
+        base = os.path.realpath(self.trash_dir)
+        p = os.path.join(self.trash_dir, nid + ".md")
+        try:
+            rp = os.path.realpath(p)
+        except OSError:
+            return None
+        if rp != base and not rp.startswith(base + os.sep):
+            return None
+        return p
+
+# 生效条件：当 node_id 传入时，若 deletions_log 中存在该 id 且 force=False 返回 tombstoned 拒绝；否则检查 trash_dir/{node_id}.md，os.path.exists 为 False 返回 not_in_trash；node_id 非法（第 5 轮，issue #172：字面闸 + realpath 闸均不过）返回 bad_node_id 且**不读任何文件**；文件含坏字节（非 UTF-8）无法解析时返回 error=corrupt 且 trash 源原样保留（不删不移）；可打开则读取并以 add(override=True) + trash frontmatter 元数据全量透传（显式形参逐项传，其余键经 **extra 回写；lifecycle_state 仅在 active→该态合法迁移时透传）恢复、移除 trash 源、audit，返回 ok True/id/forced=bool(force)；
     def restore(self, node_id: str, force: bool = False):
         """恢复：若在删除清单中且未 force → 拒绝（恢复时删除检查）。"""
         tomb = [r for r in read_jsonl(self.deletions_log) if r.get("id") == node_id]
         if tomb and not force:
             return {"ok": False, "error": "tombstoned",
                     "reason": tomb[-1].get("reason", ""), "t": tomb[-1].get("t")}
-        src = os.path.join(self.trash_dir, f"{node_id}.md")
+        # 第 5 轮（issue #172）：路径**先过闸再落地**。修前这里直接
+        # `join(trash_dir, f"{node_id}.md")` 就 open——`node_id` 可控，
+        # `../../x` / 绝对路径都能把 open 引到库外（读任意 .md 文件，
+        # 并把内容喂进节点解析面）；而 `add` 的白名单在 40 行之后才拒，
+        # 于是契约里的「结构化失败」变成未捕获 ValueError 抛出。
+        # 现判据收口在 `_trash_path` 单点，非法即结构化负路由、零 IO。
+        src = self._trash_path(node_id)
+        if src is None:
+            return {"ok": False, "error": "bad_node_id",
+                    "reason": "node_id 非法（含路径分隔符/父目录引用/越界）："
+                              "拒绝恢复，未读取任何文件"}
         if not os.path.exists(src):
             return {"ok": False, "error": "not_in_trash"}
         try:
@@ -5547,17 +5618,31 @@ class MdCGSecure(MdCGOS):
             kw.setdefault("harness", self.principal.harness)
         return kw
 
-# 生效条件：在 super()._scan_nodes() 结果上逐节点重新 _read，仅当读出的 fm 为真值时把 role、sensitivity（假值回落 DEFAULT_SENSITIVITY）、writer、session、content_kind（角色化读取视图的候选资格维度，第四阶段 6.1）写回该条目。
+    # 第 10 轮：本类需要 fm 里的 role/sensitivity/writer/session/content_kind，
+    # 而 `_node_entry` 的固定键集不含 sensitivity/writer——原实现因此**把整个库
+    # 再 open 一遍**（生产路径 mcp_server 用的正是本类，真冷启动 2N 次 open）。
+    # 打开 `_SCAN_KEEP_FM` 后，基类扫描时顺手把已解析的 fm 留在 `self._scan_fm`，
+    # 这里直接取用 ⇒ 第二遍**零 open**，而读路径的语义一个字都没动。
+    _SCAN_KEEP_FM = True
+
+# 生效条件：在 super()._scan_nodes() 结果上逐节点重新 _read，仅当读出的 fm 为真值时把 role、sensitivity（假值回落 DEFAULT_SENSITIVITY）、writer、session、content_kind（角色化读取视图的候选资格维度，第四阶段 6.1）写回该条目；第 10 轮起优先取基类留底的 `_scan_fm`（命中即零 open），缺该 nid 时才回落真读。
     def _scan_nodes(self):
         nodes = super()._scan_nodes()
+        # 留底缺该 nid（基类未开留底、或该 nid 在基类扫描里已被隔离）时回落
+        # 真读——与改动前逐位一致，**只可能少读一次，不可能换一份 fm**。
+        fms = getattr(self, "_scan_fm", None) or {}
         for nid, e in nodes.items():
-            fm, _c = self._read(e)
+            fm = fms.get(nid)
+            if fm is None:
+                fm, _c = self._read(e)
             if fm:
                 e["role"] = fm.get("role")
                 e["sensitivity"] = fm.get("sensitivity") or DEFAULT_SENSITIVITY
                 e["writer"] = fm.get("writer")
                 e["session"] = fm.get("session")
                 e["content_kind"] = fm.get("content_kind")
+        # 用完即弃：fm 留底只为这一次回填，不常驻（大库不该为此多占一份内存）。
+        self._scan_fm = None
         return nodes
 
 # 生效条件：仅当 self.index["nodes"] 中已存在 nid 时，把该条目的 sensitivity 置为 sens 并标记进 self._dirty；nid 不存在则不做任何事、无返回。

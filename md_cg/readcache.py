@@ -48,6 +48,7 @@
 """
 import os
 
+
 # 生效条件：无 required 形参，锚定环境变量名 MDCG_READ_CACHE；未设或值为 "1" 时返回 True（默认开，issue #31 生产 O(n) 全池扫描修复），显式设为其它值（含 "0"）时返回 False。
 def enabled() -> bool:
     """读缓存开关（默认开；=0 显式关闭——opt-out 退出阀）。"""
@@ -134,9 +135,24 @@ def install(cg):
         orig_status = (getattr(cg, "_read_status_uncached", None)
                        or status_fn)
         cg._read_status_uncached = orig_status
+        # 第 2 轮 + 第 11 轮订正：`direct_read`（治理面「写前重查」/「回滚比对」）
+        # 的真源必须是**盘上真值**，而 `_read_status` 自第 2 轮起会先试正文旁路
+        # 缓存（`_sidecar_hit`）——故直读必须改指 `_read_from_disk`（旁路缓存的
+        # 穿透落点）。二者返回形状一致，`direct_read` 的调用方零改动。
+        #
+        # **这里曾是一个真实缺陷**：第 2 轮把这段补丁写成了**第二个**
+        # `if _read_uncached is None:` 分支，而上面的原分支已经先赋值 ⇒ 补丁
+        # 恒不生效（死代码），`direct_read` 实际仍走 `orig_status`（会命中旁路
+        # 缓存）。在「旁路缓存档恰好不存在」的测试里它**看起来是对的**，直到
+        # 第 10 轮让同一会话内也产生可命中条目（`_sidecar_staged`）才暴露
+        # （test_govern_directread 的 G1c/G2d/G3b/G4b/G5b/G6b 六项转红）。
+        # 现合并为**一处**赋值：优先 `_read_from_disk`，无该属性（旧载体）时
+        # 回落 `orig_status`，语义与改动前逐位一致。
         if getattr(cg, "_read_uncached", None) is None:
+            _disk_fn = getattr(cg, "_read_from_disk", None)
+            _src = _disk_fn if _disk_fn is not None else orig_status
             # 穿透缓存的原始二态读（direct_read 真源）：形状同 install 前。
-            cg._read_uncached = (lambda entry: orig_status(entry)[:2])
+            cg._read_uncached = (lambda entry: _src(entry)[:2])
 
         def _cached_status(entry):
             p = entry["path"]

@@ -30,7 +30,10 @@ import threading
 from . import (nodefile, protect, routing, subgraph, chain, provenance, pooling,
                lifecycle, reach, trust, roleviews, fsutil, freshness)
 from .fsutil import (FileLock, ShardedLog, atomic_write, append_jsonl,
-                     read_jsonl, sweep_stale_temps, note_bad_payload_rows)
+                     read_jsonl, sweep_stale_temps, note_bad_payload_rows,
+                     # 第 6 轮（issue #144）：证伪节点的**可恢复摘除**要搬文件，
+                     # 复用 forget 路径同一个 publish（原子替换/跨卷回落）。
+                     publish)
 
 # 五层 + 两类负记忆 + 目标槽（白箱记忆七件套工程化：事实/规则→knowledge；
 # 假设→contextual；失败/未解→独立目录；目标→goals）。
@@ -78,6 +81,42 @@ NEG_MEMORY_MARKS = {
     "unresolved": ("问题", "已知线索", "目标"),
 }
 SCHEMA = 2
+
+# 正文旁路缓存（第 2 轮优化）的单节点正文上限：超过即不入缓存——旁路缓存是
+# 加速器而非第二真源，不该为少数巨型节点把 `_nodecache.json` 撑到几十 MB
+# （巨型节点照旧逐次读盘，行为与改动前一致）。64 KiB 覆盖绝大多数记忆卡片。
+SIDECAR_MAX_CONTENT = 64 * 1024
+
+# ---------- 第 2 轮优化：正文旁路缓存（`_nodecache.json`）----------
+#
+# 定位：把「读缓存」从**进程内**扩到**跨进程**。进程内读缓存（readcache.install）
+# 解决的是「同一进程内重复读同一节点」；而每次新起进程的**首次**读仍要逐文件
+# open——2000 节点库实测 1.9s，其中 88% 是 open 本身（本机每文件 1.31ms，
+# 而 stat 只要 0.06ms）。
+#
+# 为什么 I/O 落在这里而不是 readcache.py：`readcache` 的模块契约是
+# **只消费 `_read_status` 的第三元素标签、不捕获 OSError、不重判读失败**
+# （C-3 单点结构，由 test_c3_transient_read_negative 的 G5c 钉住）。旁路缓存
+# 是另一件事（派生物的持久化），有它自己的容错口径，故归 `mdcg`——本模块
+# 本来就拥有节点盘上路径与读失败判别，是这条 I/O 的天然归属。
+#
+# 判据与边界（与 `_read_from_disk` 的 fstat 配对）：
+#   · 装载侧**只做类型清洗、不做 stat**——校验延迟到逐条命中时（`_sidecar_hit`），
+#     于是「装载一份 2.5MB 的旁路缓存」不会给热启动加钱（热启动实测 ~25ms）；
+#   · 登记侧的 stat 取自在读句柄上（`os.fstat`），与正文严格同源；
+#   · 落盘侧按当前索引**剪枝**——已删节点的条目不留（否则文件只增不减）；
+#   · 整份文件是**派生物**：删掉它零损失（只是退回逐次读盘），损坏也零损失
+#     （装载侧静默降级为空表）。
+_SIDECAR_NAME = "_nodecache.json"
+_SIDECAR_VERSION = 1
+# 规模上限（第 7 轮健壮性）：条目数上限与整档字节上限。旁路缓存是**加速器
+# 而非第二真源**，任何规模代价都不该转嫁给用户——超限即按路径字典序截断
+# （确定性，不受插入顺序影响），被截掉的节点照旧逐次读盘，零语义变化。
+_SIDECAR_MAX_NODES = 50000
+_SIDECAR_MAX_BYTES = 64 * 1024 * 1024
+# 单档装载上限：超过即视同损坏直接弃用（防止手改/异常写入的巨型文件把
+# 启动内存打爆——本层宁可退回逐次读盘，也不接受一个 500MB 的"缓存"）。
+_SIDECAR_LOAD_MAX_BYTES = 128 * 1024 * 1024
 
 # 目标槽状态机（白箱第 5 篇第 3 章「目标」）：active 才参与检索定向。
 GOAL_STATUSES = ("active", "done", "dropped")
@@ -1268,6 +1307,141 @@ def apply_retrieval_gates(entries, terms, big_domain, context, min_results):
 
 
 # 生效条件：fp 为可读文件路径时返回其**整文件字节**的 sha256 十六进制摘要前 16 位；open/read 抛 OSError 时返回 None（读不到即「证不出」，调用方据此走 fail-open 分支）；不缓存、不解析、不看扩展名。
+def _read_node_text(p):
+    """读节点原文（第 8 轮线程池的工作单元）：任何失败返回 None。
+
+    线程池里**只做这一件事**——不解析、不建条目、不碰实例状态。解析留在
+    主线程按枚举顺序串行，索引派生物因此与线程调度无关（确定性不受并发
+    影响）。失败口径与改动前逐位一致：`OSError`（含真缺/独占句柄）与
+    `UnicodeDecodeError`（批次 53）都只跳过该文件，不猜测、不放大。
+    """
+    try:
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _scan_workers(n):
+    """全库扫描的读盘并发度（第 8 轮）：`MDCG_SCAN_WORKERS` 可调，缺省 8。
+
+    实测（2000 文件、本机 Windows + 实时防护）：串行 1814.8ms，w=4 648.5ms，
+    w=8 498.8ms，w=16 492.8ms，w=32 479.1ms——w≥8 已饱和，再高只增调度开销。
+    文件数低于 `_SCAN_PARALLEL_MIN` 时不值得起线程池（直接串行）。
+    """
+    if n < _SCAN_PARALLEL_MIN:
+        return 1
+    try:
+        w = int(os.environ.get("MDCG_SCAN_WORKERS", "8"))
+    except ValueError:
+        w = 8
+    return max(1, min(32, w))
+
+
+class _NodeStat(tuple):
+    """`(st_size, st_mtime_ns)` 的轻量载体——让目录条目表的读数能直接喂给
+    `_sidecar_stage`（后者按属性名取值，与 `os.stat_result` 同形）。"""
+    __slots__ = ()
+
+    def __new__(cls, size, mtime_ns):
+        return tuple.__new__(cls, (size, mtime_ns))
+
+    st_size = property(lambda self: self[0])
+    st_mtime_ns = property(lambda self: self[1])
+
+
+_SCAN_PARALLEL_MIN = 64
+
+
+def _load_sidecar(cg):
+    """装载正文旁路缓存（**不 stat**，校验延迟到命中时）。
+
+    容错口径（第 7 轮）：**任何**异常路径都返回空 dict——文件缺失、权限
+    不足、JSON 截断、顶层非对象、版本不符、nodes 非对象、单条形状非法、
+    整档超过装载上限。空 dict 的后果只是「本次退回逐次读盘」，且下一次
+    `close()` 会用当前盘面重写一份健康档（**自愈**）。
+    """
+    p = os.path.join(cg.root, _SIDECAR_NAME)
+    try:
+        if os.path.getsize(p) > _SIDECAR_LOAD_MAX_BYTES:
+            return {}
+        with open(p, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(raw, dict) or raw.get("v") != _SIDECAR_VERSION:
+        return {}
+    nodes = raw.get("nodes")
+    if not isinstance(nodes, dict):
+        return {}
+    out = {}
+    for k, v in list(nodes.items()):
+        if not isinstance(k, str):
+            continue
+        if not (isinstance(v, list) and len(v) == 4):
+            continue
+        if not (isinstance(v[0], int) and isinstance(v[1], int)
+                and isinstance(v[2], dict) and isinstance(v[3], str)):
+            continue
+        out[k] = v
+    return out
+
+
+def _save_sidecar(cg) -> int:
+    """落盘正文旁路缓存，返回写入条目数（0 表示未写）。
+
+    合并口径：**装载到的**（本轮未必被访问，但它们各自在被服务时已校验过，
+    且下轮装载仍会逐条 stat 校验）+ **本轮登记的**（fstat 与正文同源，
+    最可信，覆盖前者）。
+    剪枝口径：只保留当前索引里仍存在的 path——已删/已改名的节点条目就地
+    丢弃，文件不会随历史写入无限膨胀。
+    """
+    try:
+        staged = getattr(cg, "_sidecar_staged", None) or {}
+        loaded = getattr(cg, "_node_sidecar", None) or {}
+        if not staged and not loaded:
+            return 0
+        nodes = cg.index.get("nodes") or {}
+        if not nodes:
+            return 0
+        # 快照取用（全仓纪律）：nodes 是 cg.index["nodes"] 的共享面，
+        # 迭代前一律先取快照，防同进程并发写把本函数的迭代源改掉。
+        live = {e.get("path") for e in list(nodes.values()) if e.get("path")}
+        merged = {}
+        for src in (loaded, staged):
+            for k, v in list(src.items()):
+                if k in live:
+                    merged[k] = v
+        if not merged:
+            return 0
+        # 规模上限（第 7 轮）：条目数按路径字典序确定性截断（不受插入顺序
+        # 影响，两次保存结果可比）；被截掉的节点只是失去加速，语义零变化。
+        if len(merged) > _SIDECAR_MAX_NODES:
+            keep = sorted(merged)[:_SIDECAR_MAX_NODES]
+            merged = {k: merged[k] for k in keep}
+        blob = json.dumps({"v": _SIDECAR_VERSION, "nodes": merged},
+                          ensure_ascii=False)
+        if len(blob.encode("utf-8")) > _SIDECAR_MAX_BYTES:
+            # 整档超字节上限：按条目数**折半**重试（仍取字典序前缀），
+            # 直到落进上限或无可写条目——不因体量失控而写出一份巨型派生物。
+            items = sorted(merged.items())
+            n = len(items)
+            merged = {}
+            while n > 0:
+                merged = dict(items[:n])
+                blob = json.dumps({"v": _SIDECAR_VERSION, "nodes": merged},
+                                  ensure_ascii=False)
+                if len(blob.encode("utf-8")) <= _SIDECAR_MAX_BYTES:
+                    break
+                n //= 2
+            if n <= 0:
+                return 0
+        atomic_write(os.path.join(cg.root, _SIDECAR_NAME), blob)
+        return len(merged)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return 0
+
+
 def _file_digest(fp: str):
     """节点文件的**整字节身份指纹**（#80）。
 
@@ -1625,6 +1799,25 @@ def _require_unit_number(field, value) -> float:
 
 # 生效条件：构造须传入 root，经 os.path.abspath 后以 exist_ok=True 创建该目录及 LAYERS 各层子目录；autoflush 无论取值（默认 64）都原样赋给实例。
 class MdCG:
+
+    # 第 10 轮：`_scan_nodes` 是否把本次扫描**已解析出的 frontmatter** 留一份给
+    # 覆写者（`self._scan_fm`：nid → fm，只含成功入索引的节点）。
+    #
+    # 动机：`MdCGSecure._scan_nodes` 在 `super()._scan_nodes()` 之后要逐节点
+    # `self._read(e)` 一遍，只为取 role/sensitivity/writer/session/content_kind
+    # ——而**那些字段就在基类刚解析出的 fm 里**，却被 `_node_entry` 丢弃了。
+    # 生产路径（`mcp_server:4536` 用的正是 `MdCGSecure`）因此**真冷启动要
+    # open 全库两遍**（1000 节点实测 2000 次）。
+    #
+    # 为什么不让读路径去命中本会话的 `_sidecar_staged`（那是最省事的改法）：
+    # 试过，会打红 `test_c3_transient_read_negative` 的 fail-closed 红线——
+    # 节点扫描时读到了、之后被独占锁住，本该「不可读 ⇒ 不参与检索」，却会从
+    # 本会话快照里被端出来。**「少读一次」不能越过「读不到就不给」**。
+    # 把 fm 沿着**扫描**这条线传下去，读路径的语义一个字都没动。
+    #
+    # 默认 False：只有真正需要它的子类才留（普通 MdCG/MdCGOS 不多占内存）。
+    _SCAN_KEEP_FM = False
+
 # 生效条件：root 传参即被 os.path.abspath 绝对化并 makedirs(exist_ok=True) 建立 root 与模块级 LAYERS 各层目录，autoflush（默认 64，含 0 等假值）原样存入 self.autoflush，随后 _load_index() 载入索引并以 _index_signature() 记录 _index.json 签名到 self._index_sig（跨进程读面代际感知的基线，P1b-2）、sweep_stale_temps(self.root) 清扫，并把 self 登记进模块级 _LIVE_CGS；
     def __init__(self, root: str, autoflush: int = 64):
         self.root = os.path.abspath(root)
@@ -1651,6 +1844,15 @@ class MdCG:
         # 解析结果 memo 化，失效哨兵与 readcache 同源（见 _node_disk_path）。
         self._root_real = None
         self._realpath_cache = {}
+        # 目录级 realpath 缓存（第 1 轮优化）：同一目录下全部节点共享一次
+        # realpath 解析。实测 2000 节点仅 3 个目录 ⇒ realpath 调用 2001→3。
+        # 失效口径与 _realpath_cache 同源（见 _node_disk_path 文档串）。
+        self._dir_real_cache = {}
+        # 目录级条目表（第 3 轮优化）：一次 os.scandir 取全目录的
+        # (size, mtime_ns, is_symlink)。Windows 的目录枚举一次返回全部元数据，
+        # 实测 2000 文件 3.9ms，而逐路径 os.stat+islink 要 203ms（52×）。
+        # 键为相对目录（正斜杠），值为 (write_gen, table, links) 三元组。
+        self._dir_scan_cache = {}
         self._log = None
         # N212（2026-09-28）：本进程分片日志的绝对路径——代际签名把它排除在外
         # （自身写入已由 _stage 落进内存索引，计入签名会让每次自身 flush 都被
@@ -1925,6 +2127,12 @@ class MdCG:
         # realpath 进程内缓存同款兜底：签名变化 = 他进程重写过快照，旧索引
         # 代里的解析结果一并弃用（重载是稀疏事件，不构成热路径开销）。
         self._realpath_cache.clear()
+        # 第 1 轮优化：目录级 realpath 缓存同款兜底（同一次重载事件，
+        # 重建成本仅目录数条 realpath，不构成热路径开销）。
+        self._dir_real_cache.clear()
+        # 第 3 轮优化：目录条目表同款兜底（他进程写盘 ⇒ 本地 size/mtime 视角
+        # 已过期，必须重扫；重建成本 ~4ms/全库）。
+        self._dir_scan_cache.clear()
         # N224（2026-09-28）：chain / subgraph / trust 三个**派生拓扑缓存**同款
         # 失效。此前只有本地写路径（_stage 尾部三连 invalidate_cache）清它们，
         # 重载路径不清 ⇒ 重载后邻接表仍留着「已不可见节点」的 id、边条件与下游
@@ -2092,6 +2300,14 @@ class MdCG:
                 self.rebuild_index()
         except (OSError, ValueError):
             pass
+        # 第 2 轮优化：正文旁路缓存随收尾一并落盘（`_nodecache.json`）。放在
+        # compact/rebuild **之后**——剪枝要按刚落定的索引节点集合来做。本步
+        # 是纯派生物写入，失败不影响任何语义（`save_sidecar` 内部静默吞）。
+        try:
+            if self._sidecar_enabled():
+                _save_sidecar(self)
+        except (OSError, ValueError, ImportError):
+            pass
         if self._log:
             self._log.close()
             self._log = None
@@ -2197,6 +2413,70 @@ class MdCG:
             "derived_relation": fm.get("derived_relation"),
                     })
 
+    def _iter_md_files(self):
+        """枚举 LAYERS 下全部 .md 文件，**在同一次目录枚举里带回 size/mtime**。
+
+        `os.walk` 内部本就是 `os.scandir`，但它只把名字交出来；调用方要拿
+        size/mtime 还得再 `os.stat`（每文件 0.06ms，2000 文件 ~123ms）或去查
+        `_dir_entries` 的 TTL 表（**可能陈旧**——见下）。这里直接递归
+        `os.scandir`：Windows 的 `FindFirstFile/FindNextFile` 一次就把 size /
+        mtime / 属性带回，`entry.stat()` 零 syscall（第 3 轮实测 2000 文件
+        3.9ms）。于是「扫描用的名字」与「扫描用的身份」同源同代，
+        **不可能出现「枚举是新的、stat 是旧的」**。
+
+        为什么这是必须的（不只是性能）：`_dir_entries` 的表按
+        `_dirty.write_gen` + TTL（默认 1s）失效，而 `consolidate` 一类
+        「直写文件 + `rebuild_index()` 收尾」的写方**不经** `_dirty`，其改写
+        推不动 `write_gen`。若扫描拿 TTL 表里的旧 stat 去比对旁路缓存，旧
+        stat 会与旧条目「全等」，于是**刚写下的新正文被旧正文顶掉**
+        （test_p6_consolidate 的 `has_neg_conditions` 即此现场）。扫描路径
+        一律用本次枚举的真值，这条漏洞从根上不存在。
+
+        遍历序与 `os.walk(topdown=True, followlinks=False)` **逐位一致**：
+        同一目录内的条目按 `os.scandir` 原始序、子目录用 `reversed` 压栈后
+        弹出（＝按原始序 DFS）。`_scan_nodes` 的 dict「后到覆盖」语义因此
+        与改动前完全相同。
+
+        yield `(abs_path, layer, rel_posix, name, size, mtime_ns)`；
+        size/mtime_ns 取不到（stat 抛 OSError）时为 None——该文件不走旁路
+        缓存、也不登记，照旧真读。
+        """
+        for layer in LAYERS:
+            stack = [os.path.join(self.root, layer)]
+            while stack:
+                d = stack.pop()
+                try:
+                    with os.scandir(d) as it:
+                        ents = list(it)
+                except OSError:
+                    continue
+                subdirs = []
+                for e in ents:
+                    try:
+                        # 分类口径与 os.walk 相同：is_dir() **跟随**符号链接，
+                        # 但 followlinks=False ⇒ 不深入符号链接目录。
+                        is_dir = e.is_dir()
+                    except OSError:
+                        is_dir = False
+                    if is_dir:
+                        if not e.is_symlink():
+                            subdirs.append(e.path)
+                        continue
+                    if not e.name.endswith(".md"):
+                        continue
+                    try:
+                        st = e.stat()       # 跟随符号链接，与 open() 同语义
+                        sz, mt = st.st_size, st.st_mtime_ns
+                    except OSError:
+                        sz = mt = None
+                    try:
+                        rel = os.path.relpath(
+                            e.path, self.root).replace("\\", "/")
+                    except ValueError:
+                        continue
+                    yield e.path, layer, rel, e.name, sz, mt
+                stack.extend(reversed(subdirs))
+
 # 生效条件：遍历模块级 LAYERS 各层目录下所有 .md 文件，读取抛 OSError 的跳过；nid 取 fm.get("id")，为假值时回落去掉 .md 的文件名；fm 经 nodefile.frontmatter_problem 判为损坏（类型非法）或 self._node_entry(p, layer, fm, content) 抛异常者**一律隔离**（记入 self._quarantined，路径 + 原因），不进索引、不改盘、continue；其余条目经 self._node_entry(p, layer, fm, content) 构造；返回按 nid 排序的 nodes；
     def _scan_nodes(self):
         nodes = {}
@@ -2210,53 +2490,115 @@ class MdCG:
         # 隔离清单经 self._quarantined 透出到 health / op=info（仅确有隔离时
         # 出键，健康库键集逐位不变）。
         quarantined = {}
-        for layer in LAYERS:
-            base = os.path.join(self.root, layer)
-            for dirpath, _dirs, files in os.walk(base):
-                for fn in files:
-                    if not fn.endswith(".md"):
-                        continue
-                    p = os.path.join(dirpath, fn)
-                    try:
-                        with open(p, encoding="utf-8") as f:
-                            fm, content = nodefile.loads(f.read())
-                    except (OSError, UnicodeDecodeError):
-                        # UnicodeDecodeError（批次 53 补）：非 UTF-8 字节的损坏
-                        # 真源此前会炸穿整库装载/重建（init → _load_index →
-                        # 指纹失配回落 _scan_nodes → 一个坏文件全库打不开）。
-                        # 与 reconcile v0 的 T9 边界同口径：真源损坏只跳过，
-                        # 不猜测不放大——启动对账（reconcile_state）会对其
-                        # 告警留痕。
-                        continue
-                    nid = fm.get("id") or fn[:-3]
-                    # legacy P3（自愈腿）：索引是**派生物**，键一律归一为 str
-                    # ——存量毒文件（旧版本 add(123) 写出 / 外部编辑器落下的
-                    # `id: 123`）与新机复制还原的库由此可自愈；不归一则
-                    # 下面 sorted(nodes) 混型即 TypeError「整库永久打不开」。
-                    # 写面（add）对非字符串 node_id 已 fail-closed 拒写，此处
-                    # 只兜盘面既有脏数据——拒写与自愈各司其职。
-                    nid = str(nid)
-                    _rel = os.path.relpath(p, self.root).replace("\\", "/")
-                    # ① 类型可用性判据（单点，nodefile.frontmatter_problem）
-                    _prob = nodefile.frontmatter_problem(fm, content)
-                    if _prob:
-                        quarantined[nid] = {"path": _rel,
-                                            "reason": "frontmatter 损坏：" + "；".join(_prob)}
-                        continue
-                    # ② 判据之外仍可能抛（下游消费面比类型判据更宽）——兜底
-                    #    收口在此，异常**不得**逃出装载路径（#146①的根因）。
-                    try:
-                        nodes[nid] = self._node_entry(p, layer, fm, content)
-                    except Exception as exc:                   # noqa: BLE001
-                        quarantined[nid] = {
-                            "path": _rel,
-                            "reason": "索引条目构造失败：%s: %s"
-                                      % (type(exc).__name__, str(exc)[:160])}
-                        continue
+        # 第 10 轮：本次扫描的 fm 留底（仅 `_SCAN_KEEP_FM` 为真时填充）。
+        # **每次全量扫描都重建**（与 quarantined 同口径）：不留上一次的残影，
+        # 覆写者据此判定「这个 nid 的 fm 就在手上」。
+        _keep_fm = getattr(self, "_SCAN_KEEP_FM", False)
+        _scan_fm = {}
+        if _keep_fm:
+            self._scan_fm = _scan_fm
+        # 第 4 轮优化：全库扫描也接**正文旁路缓存**——冷启动（无快照/快照失配/
+        # 快照损坏）不必再逐文件 open。实测 2000 节点冷启动 2553ms 中约 2300ms
+        # 是 2000 次 open，接旁路缓存后这一腿换成**本次目录枚举自带的** stat。
+        # 命中判据与读面同源（同 (size, mtime_ns) 全等），未命中即回落原 open
+        # 路径——**只可能少开一次文件**。
+        # 这条路径正是「快照丢了/坏了」的恢复腿与「外部增删一个文件」的增量腿，
+        # 也就是用户第一次跑、或盘面被外部改动后重开时的体验所在。
+        _side_on = self._sidecar_enabled()
+        _prior = self._sidecar_map() if _side_on else {}
+        # ── 三遍结构（第 8 轮）：枚举 → 并发读盘 → 串行解析 ──────────────
+        # 为什么拆：本机 2000 文件串行 open+read 实测 1814.8ms，8 线程 498.8ms
+        # （3.6×，w≥8 后饱和）——**纯 I/O 等待**，Windows 实时防护的逐文件拦截
+        # 可并行。解析与建条目仍留在主线程、按枚举顺序串行：索引是派生物，
+        # 其内容不得依赖线程调度（下方仍按 nid 排序返回，双重确定）。
+        jobs = []
+        for p, layer, _rel, fn, _sz, _mt in self._iter_md_files():
+            fm = content = None
+            if _side_on and _sz is not None:
+                _rec = _prior.get(_rel)
+                # 身份判据与读面同源（(size, mtime_ns) 全等），但**读数来自
+                # 本次枚举**（`_iter_md_files`），不经 TTL 表——否则「直写文件
+                # + rebuild」的写方（consolidate）会把自己刚写下的正文顶成
+                # 旧正文。见 `_iter_md_files` 的说明。
+                if (_rec is not None and _sz == _rec[0] and _mt == _rec[1]):
+                    fm, content = _rec[2], _rec[3]
+            jobs.append((p, layer, _rel, fn, fm, content, _sz, _mt))
+        # 第二遍：只读原文（不做解析）——可并行
+        todo = [i for i, j in enumerate(jobs) if j[5] is None]
+        raws = {}
+        if todo:
+            _w = _scan_workers(len(todo))
+            if _w > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=_w) as _ex:
+                    for i, raw in zip(
+                            todo,
+                            _ex.map(_read_node_text,
+                                    (jobs[i][0] for i in todo),
+                                    chunksize=16)):
+                        raws[i] = raw
+            else:
+                for i in todo:
+                    raws[i] = _read_node_text(jobs[i][0])
+        # 第三遍：串行解析 + 建条目（顺序 = 枚举顺序）
+        for i, (p, layer, _rel, fn, fm, content, _sz, _mt) in enumerate(jobs):
+            if content is None:
+                raw = raws.get(i)
+                if raw is None:
+                    # UnicodeDecodeError（批次 53 补）：非 UTF-8 字节的损坏
+                    # 真源此前会炸穿整库装载/重建（init → _load_index →
+                    # 指纹失配回落 _scan_nodes → 一个坏文件全库打不开）。
+                    # 与 reconcile v0 的 T9 边界同口径：真源损坏只跳过，
+                    # 不猜测不放大——启动对账（reconcile_state）会对其
+                    # 告警留痕。
+                    continue
+                fm, content = nodefile.loads(raw)
+                # 第 4 轮：真读过的文件顺手登记旁路缓存——于是**第一次运行**
+                # 也能落下一份，此后即便快照丢失也可免 open 恢复。
+                # 身份取**本次枚举**的读数（与名字同源同代），不再另发一次
+                # `_dir_stat`：既省一遍 syscall，也保证登记的 (size, mtime)
+                # 就是扫描时看到的那一对。
+                if _side_on and _sz is not None:
+                    self._sidecar_stage(
+                        {"path": _rel}, _NodeStat(_sz, _mt), fm, content)
+            nid = fm.get("id") or fn[:-3]
+            # legacy P3（自愈腿）：索引是**派生物**，键一律归一为 str
+            # ——存量毒文件（旧版本 add(123) 写出 / 外部编辑器落下的
+            # `id: 123`）与新机复制还原的库由此可自愈；不归一则
+            # 下面 sorted(nodes) 混型即 TypeError「整库永久打不开」。
+            # 写面（add）对非字符串 node_id 已 fail-closed 拒写，此处
+            # 只兜盘面既有脏数据——拒写与自愈各司其职。
+            nid = str(nid)
+            # _rel 已在枚举遍算出（第 4 轮）——此处不再重算 `os.path.relpath`：
+            # 它是 2000 节点扫描里 0.13s 的纯冗余（同参数同结果），而 relpath
+            # 内部要走 normcase/abspath。
+            # ① 类型可用性判据（单点，nodefile.frontmatter_problem）
+            _prob = nodefile.frontmatter_problem(fm, content)
+            if _prob:
+                quarantined[nid] = {"path": _rel,
+                                    "reason": "frontmatter 损坏：" + "；".join(_prob)}
+                continue
+            # ② 判据之外仍可能抛（下游消费面比类型判据更宽）——兜底
+            #    收口在此，异常**不得**逃出装载路径（#146①的根因）。
+            try:
+                nodes[nid] = self._node_entry(p, layer, fm, content)
+            except Exception as exc:                   # noqa: BLE001
+                quarantined[nid] = {
+                    "path": _rel,
+                    "reason": "索引条目构造失败：%s: %s"
+                              % (type(exc).__name__, str(exc)[:160])}
+                continue
+            # 第 10 轮：需要它的子类（`_SCAN_KEEP_FM=True`）在此把刚解析出的
+            # fm 留一份——`_node_entry` 只收录固定键集，role/sensitivity/
+            # writer/session/content_kind 不在其中，而 `MdCGSecure` 要的就是
+            # 这几个。留着它，覆写者就不必把整个库再 open 一遍。
+            if _keep_fm:
+                _scan_fm[nid] = fm
         # 隔离清单**每次全量扫描都重建**（不累加）——扫描即盘面真相，上一次
         # 被隔离的文件修好后本次自动回归索引（自愈腿，与 legacy P3 同向）。
         self._quarantined = quarantined
-        # 索引序确定性：按 nid 排序返回。os.walk 的遍历序是**文件系统事实**
+        # 索引序确定性：按 nid 排序返回。枚举序（`_iter_md_files` 的 scandir
+        # 原始序）是**文件系统事实**
         # （NTFS 上常为字母序，但换 FS / 目录碎片化后不保证），若直接作为
         # index["nodes"] 的物理序，就会让「完全并列」的结果顺序依赖重建路径。
         # 排序后重建序恒定（增量路径另由 cut_by_relevance 的 nid 终键兜住）。
@@ -2302,15 +2644,151 @@ class MdCG:
     # symlink/junction 中途改挂不推进任何代际——改挂后本进程内沿用旧解析
     # （越界判定同窗口），跨进程/外部改挂的可见性不保证；_maybe_reload_index
     # 的签名变化事件会整池清空本缓存兜底。
+    # ---------- 第 3 轮优化：目录级条目表（免逐路径 stat/islink）----------
+    #
+    # 动机（实测，2000 节点库、热启动后首次检索 602ms）：剩下两个热点恰好是
+    # 逐路径系统调用——`nt._path_islink` 2000 次 177ms（29%）+ `nt.stat` 2002
+    # 次 163ms（27%），合计 56%。而 Windows 的 `FindFirstFile/FindNextFile`
+    # 一次枚举就把 size / mtime / 文件属性全部带回：`os.scandir` 取满 2000
+    # 个文件的 `is_symlink()` + `stat()` 实测只要 **3.9ms**（52×）。
+    #
+    # 失效口径：条目表按 `_dirty.write_gen` 键控——任何一次写入即整表作废、
+    # 下次访问重建（全库重建 ~4ms，比一次 open 还便宜，无需更细粒度）。
+    # `_maybe_reload_index`（他进程写入/快照换代）同款清空。
+    #
+    # 诚实边界：进程内**外部**改写（不经本实例写路径）不会推进 write_gen，
+    # 本表因此可能给出旧 (size, mtime)——故除 write_gen 外再加**时间上限**
+    # `MDCG_DIRSCAN_TTL`（秒，默认 1.0）：条目表最多存活这么久，超时即重扫
+    # （全库重扫 ~4ms，摊到每次检索可忽略）。于是「外部改写不可见」的窗口
+    # 由「进程生命周期」收敛到 ≤1s，**严格强于**既有 readcache（后者一旦
+    # 读过就在进程内长期生效）；而基线是「每次读都 stat」，其窗口为 0。
+    # 设 0 即完全退回基线口径（每次 stat/islink）；`MDCG_DIRSCAN=0` 整体退出。
+    # 治理面的直读（`readcache.direct_read` → `_read_from_disk`）**穿透**本表
+    # 的内容面：它照旧真 open，只把路径解析交给本表。
+
+    def _dir_scan_on(self) -> bool:
+        return os.environ.get("MDCG_DIRSCAN", "1") == "1"
+
+    def _dir_scan_ttl(self) -> float:
+        try:
+            return float(os.environ.get("MDCG_DIRSCAN_TTL", "1.0"))
+        except ValueError:
+            return 1.0
+
+    def _dir_entries(self, rel_dir):
+        """返回该相对目录的 `(table, links)`；拿不到返回 `(None, None)`。
+
+        table: {文件名: (size, mtime_ns)}——**仅普通文件**
+        links: {文件名}——符号链接（调用方须回落整路径 realpath）
+        """
+        gen = getattr(self._dirty, "write_gen", 0)
+        now = time.monotonic()
+        hit = self._dir_scan_cache.get(rel_dir)
+        if hit is not None and hit[0] == gen and now < hit[3]:
+            return hit[1], hit[2]
+        d = os.path.join(self.root, rel_dir) if rel_dir else self.root
+        table, links = {}, set()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        if e.is_symlink():
+                            links.add(e.name)
+                            continue
+                        if not e.is_file():
+                            continue
+                        st = e.stat()      # Windows：目录枚举已带回，零 syscall
+                        table[e.name] = (st.st_size, st.st_mtime_ns)
+                    except OSError:
+                        continue
+        except OSError:
+            table, links = None, None
+        self._dir_scan_cache[rel_dir] = (
+            gen, table, links, now + self._dir_scan_ttl())
+        return table, links
+
+    def _retire_path(self, node_id):
+        """证伪节点的回收站落点（第 6 轮，issue #144）；拿不到返回 None。
+
+        目录选择：有 `trash_dir` 的载体（MdCGOS）**复用它**——于是
+        `restore(node_id)` 天然能把证伪节点取回；纯 `MdCG` 用
+        `<root>/_falsified_trash`（惰性创建，不在 LAYERS 内、不进索引、
+        不进目录指纹）。
+        文件名：node_id 过 `_NODE_ID_RE` 且不含 `..` 才直接用，否则退化为
+        `nid_<sha1[:12]>`——**绝不让不可信 id 参与路径拼接**（与本轮
+        `mdcos._trash_path` 同一条纪律；差别是这里连非法 id 也必须能落地，
+        因为证伪裁决本身不该被一个脏 id 卡死）。
+        """
+        d = getattr(self, "trash_dir", None) or os.path.join(
+            self.root, "_falsified_trash")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            return None
+        nid = node_id if isinstance(node_id, str) else ""
+        if not (nid and len(nid) <= 128 and ".." not in nid
+                and nid == os.path.basename(nid)
+                and _NODE_ID_RE.match(nid)):
+            nid = "nid_" + hashlib.sha1(
+                str(node_id).encode("utf-8")).hexdigest()[:12]
+        return os.path.join(d, nid + ".md")
+
+    def _dir_islink(self, rel_dir, name) -> bool:
+        """该目录下该名字是否符号链接（免 syscall；拿不到就逐路径问）。"""
+        if not self._dir_scan_on():
+            return os.path.islink(os.path.join(self.root, rel_dir, name))
+        table, links = self._dir_entries(rel_dir)
+        if table is None:
+            return os.path.islink(os.path.join(self.root, rel_dir, name))
+        if name in table:
+            return False
+        if name in links:
+            return True
+        # 表里没有（枚举后外部新增/枚举失败）：回落逐路径，宁慢不误判。
+        return os.path.islink(os.path.join(self.root, rel_dir, name))
+
+    def _dir_stat(self, rel_dir, name):
+        """该目录下该名字的 `(size, mtime_ns)`（免 syscall；拿不到返回 None）。"""
+        if not self._dir_scan_on():
+            return None
+        table, _links = self._dir_entries(rel_dir)
+        if table is None:
+            return None
+        return table.get(name)
+
     def _node_disk_path(self, e):
         rp = e.get("path") or ""
         hit = self._realpath_cache.get(rp)
         if hit is not None and self._realpath_fresh(rp, hit):
             return hit[1]
-        p = os.path.realpath(os.path.join(self.root, rp))
+        # 第 1 轮优化（性能）：**目录级 realpath**。原实现每节点一次
+        # `os.path.realpath(join(root, rp))`，而 realpath 在 Windows 上落到
+        # `nt._getfinalpathname`（每次 2 次句柄查询）。实测 2000 节点库冷态
+        # 首查：realpath 段 366.7ms / 2001 次调用，占首次检索 1726ms 的 29%；
+        # 而节点只分布在 3 个目录里 —— 目录解析一次、文件侧只做拼接即可。
+        #
+        # 语义保持（**不是**放宽校验）：realpath 会解析路径**每一段**的符号
+        # 链接，含末段。拆成「目录 realpath + 末段拼接」后，末段若本身是链接
+        # 就绕过了。故末段单独判链接——第 3 轮起改由**目录条目表**回答
+        # （`_dir_islink`，`os.scandir` 免费带回），命中即回落整路径 realpath。
+        # 结果字符串与旧实现逐位一致（`rp` 来自盘面 relpath，大小写已是在盘形态）。
         rr = self._root_real
         if rr is None:
             rr = self._root_real = os.path.realpath(self.root)
+        _d = os.path.dirname(rp)
+        _base = os.path.basename(rp)
+        if _d:
+            dr = self._dir_real_cache.get(_d)
+            if dr is None:
+                dr = os.path.realpath(os.path.join(self.root, _d))
+                self._dir_real_cache[_d] = dr
+            p = os.path.join(dr, _base)
+            if self._dir_islink(_d, _base):
+                p = os.path.realpath(p)      # 末段是链接：回落整路径解析
+        else:
+            p = os.path.join(rr, _base)
+            if os.path.islink(p):
+                p = os.path.realpath(p)
         if p != rr and not p.startswith(rr + os.sep):
             raise ValueError(
                 f"节点路径越界（P2-20）：{rp!r} -> {p}"
@@ -3644,20 +4122,42 @@ class MdCG:
         可照旧入读缓存），fsutil.READ_FAIL_TRANSIENT＝**瞬时读失败**（可重试，
         不得以「新鲜」身份固化）。判别落在 `_note_read_oserror` 一处，
         `readcache` 只消费标签、不看异常类型。
+
+        第 2 轮优化：本方法先试**正文旁路缓存**（`_sidecar_hit`，按
+        (size, mtime_ns) 校验），命中即返回、**完全不 open**。真读盘落在
+        `_read_from_disk`——治理面的「写前重查」经 `readcache.direct_read`
+        走 `_read_uncached`（＝`_read_from_disk`），**穿透**旁路缓存读盘上
+        真值，语义与改动前逐位一致。
         """
+        if self._sidecar_enabled():
+            hit = self._sidecar_hit(entry)
+            if hit is not None:
+                return hit
+        return self._read_from_disk(entry)
+
+    def _read_from_disk(self, entry):
+        """真读盘的三态单点（旁路缓存被穿透时的落点，语义＝改动前）。"""
         try:
             p = self._node_disk_path(entry)
         except ValueError:
             return None, None, None
         try:
             with open(p, encoding="utf-8") as f:
-                fm, content = nodefile.loads(f.read())
+                _raw = f.read()
+                # 第 2 轮：**同一句柄**上取 fstat——与本句柄读到的字节严格对应，
+                # 不存在「读完文件再 stat 路径」的竞态（那样会把改动后的新 stat
+                # 与旧正文配对落进旁路缓存，下次开机即命中陈旧正文）。
+                try:
+                    _st = os.fstat(f.fileno())
+                except OSError:
+                    _st = None
         except UnicodeDecodeError:
             return None, None, None
         except OSError as exc:
             if self._note_read_oserror(p, exc):
                 return None, None, fsutil.READ_FAIL_TRANSIENT
             return None, None, None
+        fm, content = nodefile.loads(_raw)
         # issue #146④：损坏 frontmatter 按**不可读**返回（三态里的「终态缺失」
         # ——不可读即不存在，与越界/真缺同形）。修前 `_read_status` 是唯一
         # 「读盘 → 交给调用方」的单点，坏 fm 从这里透出去：`protect.mark` /
@@ -3666,7 +4166,91 @@ class MdCG:
         # 本层只消费、不另写第二份类型判据。
         if nodefile.frontmatter_problem(fm, content):
             return None, None, None
+        if _st is not None:
+            self._sidecar_stage(entry, _st, fm, content)
         return fm, content, None
+
+    # ---------- 第 2 轮优化：正文旁路缓存（免 open 的读面）----------
+    #
+    # 动机（实测，2000 节点库）：本机 `open()+read` 每文件 1.31ms、`os.stat`
+    # 每文件 0.06ms（22× 差），Windows 实时防护对每次 open 都要拦一道。于是
+    # 「热启动后的首次检索」要付 2000 次 open ≈ 1.9s，而其中真正用于打分
+    # 的时间只有 ~0.1s。旁路缓存把这条腿从「逐文件 open」换成「逐文件 stat」。
+    #
+    # 新鲜度判据：(size, mtime_ns) 全等——与 make/git 同族。诚实边界：外部
+    # 改写且**字节数不变、mtime 又被回拨**的场景不可见（需显式篡改 mtime，
+    # 如 `touch -r`）；这是**有意接受**的取舍，`MDCG_NODE_SIDECAR=0` 可关，
+    # `MDCG_READ_CACHE=0`（读缓存总开关）同样关掉本层。
+    # 与既有 `_dir_fingerprint`（只看目录 mtime、**完全不看**内容改写）相比，
+    # 本判据在「同目录内容级改写」上严格更强，不是放松。
+    #
+    # 落盘面：`<root>/_nodecache.json`——**独立文件**，不进 `_index.json`
+    # （快照必须保持「两次 rebuild 字节相同」，见 test_p2_six_elements）。
+
+    def _sidecar_enabled(self) -> bool:
+        """旁路缓存总开关（读缓存关 ⇒ 本层关；显式 opt-out 亦可）。"""
+        return (os.environ.get("MDCG_READ_CACHE", "1") == "1"
+                and os.environ.get("MDCG_NODE_SIDECAR", "1") == "1")
+
+    def _sidecar_map(self):
+        """惰性装载旁路缓存（首次真正需要时才解析 JSON，不拖慢热启动）。"""
+        m = getattr(self, "_node_sidecar", None)
+        if m is None:
+            m = self._node_sidecar = _load_sidecar(self)
+        return m
+
+    def _sidecar_hit(self, entry):
+        """旁路缓存命中判定：盘上身份校验通过才返回 `(fm, content, None)`。
+
+        校验顺序刻意把**便宜的放前面**：路径边界闸（P2-20，经
+        `_node_disk_path`，已 memo）→ 盘上身份（第 3 轮起优先取目录条目表，
+        免 syscall）→ 全等比对 → 类型判据。任一环不过即返回 None，调用方
+        回落真读盘——**只可能少省一次 open，不可能给出盘上没有的正文**。
+
+        **只认「装载到的」档，不认「本次会话刚读到的」**（第 10 轮的试改已
+        回退）：让本会话的 `_sidecar_staged` 参与命中会把
+        `test_c3_transient_read_negative` 的 fail-closed 红线打红——节点在
+        扫描时读到了，之后被外部独占锁住，本该「不可读 ⇒ 不参与检索」，
+        却会从本会话快照里被端出来。**「少读一次」不能越过「读不到就不给」**。
+        `MdCGSecure` 那条「读两遍」改由扫描面自己消（见 `_scan_fm`）。
+        """
+        rel = entry.get("path") or ""
+        rec = self._sidecar_map().get(rel)
+        if rec is None:
+            return None
+        try:
+            p = self._node_disk_path(entry)
+        except ValueError:
+            return None                      # 越界：交回原路径处理（同旧语义）
+        # 第 3 轮：盘上身份优先问**目录条目表**（scandir 免费带回 size/mtime）；
+        # 表里没有（枚举后外部新增、枚举失败、MDCG_DIRSCAN=0）才逐路径 os.stat。
+        _d = os.path.dirname(rel)
+        ident = self._dir_stat(_d, os.path.basename(rel)) if _d else None
+        if ident is None:
+            try:
+                st = os.stat(p)
+            except OSError:
+                return None
+            ident = (st.st_size, st.st_mtime_ns)
+        if ident[0] != rec[0] or ident[1] != rec[1]:
+            return None
+        fm, content = rec[2], rec[3]
+        if not isinstance(fm, dict) or not isinstance(content, str):
+            return None
+        if nodefile.frontmatter_problem(fm, content):
+            return None                      # 旁路缓存被手改坏：回落真读盘
+        return fm, content, None
+
+    def _sidecar_stage(self, entry, st, fm, content):
+        """登记「刚读到的正文 + 它的盘上身份」——close 时统一落盘。"""
+        rel = entry.get("path") or ""
+        if not rel or len(content) > SIDECAR_MAX_CONTENT:
+            return
+        try:
+            staged = self._sidecar_staged
+        except AttributeError:
+            staged = self._sidecar_staged = {}
+        staged[rel] = [st.st_size, st.st_mtime_ns, fm, content]
 
 # 生效条件：等价于 _read_status(entry) 的前两项（成功 → (fm, content)；终态缺失或瞬时读失败 → (None, None)）；返回形状与语义同 C-3 修复前**逐位一致**，包内全部既有调用点（_read_many / _goal_entry / _neg_coverage / 派生物 / 治理面）不受三态面影响；
     def _read(self, entry):
@@ -5115,12 +5699,39 @@ class MdCG:
             # 原样保留。守卫必须在 add_rejected 之前——拒绝路径零副作用。
             protect.guard_forget(self, node_id, override=override,
                                  actor=getattr(self, "actor", None))
+            # 第 6 轮（issue #144）：**路径闸前置到一切副作用之前**。
+            # 修前这里是 `os.remove(os.path.join(self.root, node["path"]))`：
+            #   · 路径裸拼、绕过读面 P2-20 闸——索引被污染（手改 .md 的
+            #     frontmatter/路径字段）时就是**任意文件删除**；
+            #   · 且是不可恢复的硬删（无快照、不进回收站、无墓碑）。
+            # 现改走 `_node_disk_path`（读面**同一个**校验单点），越界即
+            # 零副作用负路由——`add_rejected` 都还没执行，库面完全不变。
+            try:
+                _src = self._node_disk_path(node)
+            except ValueError as exc:
+                return {"action": "falsified_blocked",
+                        "reason": "节点路径越界（P2-20）：%s" % exc,
+                        "new_id": None, "evidence_count": None,
+                        "demoted": None}
             # 移入 rejected：负记忆化
             self.add_rejected(hypothesis=node["content"][:200],
                               reason=evidence,
                               verification_basis="test")
-            # 从原位置删除（节点进入 rejected 层）
-            os.remove(os.path.join(self.root, node["path"]))
+            # 从原位置**可恢复地**摘除（节点进入 rejected 层）。修前是裸
+            # `os.remove`——一次误判的 verify 即永久丢节点；现先搬进回收站
+            # （有 `trash_dir` 的载体用它，纯 `MdCG` 用 `<root>/_falsified_trash`），
+            # 搬不动才退回 os.remove（保留旧行为作最后手段，不因回收站不可用
+            # 卡死裁决）。落点可由 `restore(node_id)` 取回。
+            _dst = self._retire_path(node_id)
+            _moved = False
+            if _dst is not None:
+                try:
+                    publish(_src, _dst)
+                    _moved = True
+                except OSError:
+                    _moved = False
+            if not _moved:
+                os.remove(_src)
             self._unstage(node_id)      # 同上：索引删除必须可重放（防幽灵条目）
             trust.invalidate_cache(self)        # 索引已变 → 反查索引作废
             # 地基塌了：直接下游立即标存疑（**同步一跳**，永不抛、不阻断本次裁决）
