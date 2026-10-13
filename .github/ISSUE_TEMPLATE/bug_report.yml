@@ -1,0 +1,141 @@
+name: 缺陷报告
+description: 报告一个可复现的缺陷（请先确认这是本衍生版引入的问题）
+title: "[Bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 先确认提到哪里
+
+        本仓库是 [FuRongJun-1999/dsh-memory](https://github.com/FuRongJun-1999/dsh-memory) 的**优化衍生版**。
+
+        | 问题类型 | 提到哪 |
+        |---|---|
+        | 本仓库 11 轮优化引入的行为变化 | ✅ 本仓库（你正在这里） |
+        | 上游本身的功能缺陷、评测数据 | ❌ → [上游仓库](https://github.com/FuRongJun-1999/dsh-memory/issues) |
+
+        **不确定属于哪一类？** 先在这里提，我们会帮你判断。
+
+        > ⚠️ **请勿在 Issue 中粘贴记忆库的真实内容**。如需提供，请用脱敏后的最小样例。
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索过现有 Issue，没有重复
+          required: true
+        - label: 我已阅读 README 的「常见问题（上手向）」一节
+          required: true
+        - label: 这不是一个安全问题（安全问题请走 SECURITY.md 的私密渠道）
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 实际行为
+      description: 发生了什么？请贴出完整的错误信息或异常返回体。
+      placeholder: |
+        期望：……
+        实际：……
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 最小可复现的步骤。命令、配置片段、调用参数都请写全。
+      placeholder: |
+        1. 克隆本仓库到 ……
+        2. 设置 MDCG_ROOT=……
+        3. 执行 ……
+        4. 观察到 ……
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: 使用的提交 / 版本
+      description: 运行 `git rev-parse HEAD` 的结果，或版本号。
+      placeholder: "958097d 或 0.8.1-opt.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - WSL
+        - Docker / 容器
+        - 其它（请在下方说明）
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python 版本
+      description: 运行 `python --version` 的结果。
+      placeholder: "3.13.14"
+    validations:
+      required: true
+
+  - type: input
+    id: harness
+    attributes:
+      label: 宿主（MCP 客户端）
+      description: 通过哪个宿主使用？如果是直接跑 MCP server，请写「直接」。
+      placeholder: "DSH / Claude Code / Codex CLI / 直接"
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: 相关配置
+      description: MCP 配置片段与相关环境变量（**请先脱敏令牌**）。
+      render: json
+      placeholder: |
+        {
+          "mcpServers": {
+            "lingshu": {
+              "command": "python",
+              "args": ["-m", "md_cg.mcp_server"],
+              "env": { "MDCG_ROOT": "…" }
+            }
+          }
+        }
+    validations:
+      required: false
+
+  - type: textarea
+    id: optimize-check
+    attributes:
+      label: 优化开关对照（如怀疑与优化有关，请填）
+      description: |
+        本衍生版新增了若干性能开关。如果怀疑问题与优化有关，请给出**关闭全部优化后**的结果：
+        `MDCG_READ_CACHE=0 MDCG_DIRSCAN=0 MDCG_NODE_SIDECAR=0 MDCG_SCAN_WORKERS=1`
+      render: text
+      placeholder: |
+        优化全开时：……
+        优化全关后：……
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: |
+        宿主日志、`python -m md_cg.mcp_server --show-config` 的输出。
+        **请勿包含记忆库真实内容或令牌。**
+      render: text
+    validations:
+      required: false

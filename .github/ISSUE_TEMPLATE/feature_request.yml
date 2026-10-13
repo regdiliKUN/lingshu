@@ -1,0 +1,82 @@
+name: 功能建议
+description: 提出一个新功能或改进建议
+title: "[Feature] "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 先想清楚这个问题
+
+        本仓库是上游的**优化衍生版**，目标是**保持行为等价的前提下提升性能与修补缺陷**，
+        **不是**添加新功能。
+
+        因此：
+
+        - **上游已有但本仓库没有的功能** → 请先确认是不是基线差异（本仓库基线为上游 `958097d`），
+          这种情况请到[上游仓库](https://github.com/FuRongJun-1999/dsh-memory/issues)提。
+        - **全新的能力** → 同样建议先提到上游，本仓库只承载优化改动。
+        - **对现有优化方向的改进**（例如换一种缓存策略、扩大收益）→ ✅ 本仓库欢迎。
+
+        如果你不确定，请照常提交，我们会在 triage 时告诉你该往哪走。
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索过现有 Issue 与上游仓库，没有重复
+          required: true
+        - label: 我理解本仓库的定位是「优化衍生版」而非功能新增
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到的问题
+      description: 描述你实际遇到的困难或性能瓶颈，而不是直接跳到方案。
+      placeholder: |
+        我在 …… 场景下，观察到 ……
+        这让我无法 ……
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你期望的方案
+      description: 你希望它怎么工作？如果能给出接口形态或配置项名称更好。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你考虑过的替代方案
+      description: 还有哪些做法？为什么你倾向当前这个？
+    validations:
+      required: false
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 数据或证据（如涉及性能）
+      description: |
+        如果是性能相关的建议，请给出**实测数据**。本项目的性能结论以**系统调用计数**为主证、
+        墙钟为辅证（本机墙钟噪声 ±15~30%）。
+      render: text
+      placeholder: |
+        库规模：2000 节点
+        指标：……
+        当前读数：……
+        期望读数：……
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: 补充信息
+      description: 任何其它有助于理解的内容。
+    validations:
+      required: false

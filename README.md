@@ -1,5 +1,571 @@
 <div align="center">
 
+# 灵枢 LINGSHU · 优化衍生版
+
+### 让 AI Agent 拥有不可遗忘的长期记忆
+
+**一个把「记忆」做成纯文本、可审计、零 LLM 裁决的 AI 长期记忆系统**
+
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Protocol: MCP](https://img.shields.io/badge/Protocol-MCP-blue)
+![Python](https://img.shields.io/badge/Python-%E2%89%A53.12-3776AB)
+![Node](https://img.shields.io/badge/Node-%E2%89%A522.19-brightgreen)
+![Fork](https://img.shields.io/badge/Fork%20of-FuRongJun--1999%2Fdsh--memory-8A2BE2)
+![Optimization](https://img.shields.io/badge/%E4%BC%98%E5%8C%96-11%20%E8%BD%AE-orange)
+
+</div>
+
+---
+
+> ## ⚠️ 衍生版声明（请先读这一段）
+>
+> 本仓库是 **[FuRongJun-1999/dsh-memory](https://github.com/FuRongJun-1999/dsh-memory)（灵枢 LINGSHU）** 的**优化衍生版**，**不是原创项目**。
+>
+> - **上游作者**：符荣峻（FuRongJun-1999）· 上游许可：**MIT** · 本仓库基线：上游 `958097d`
+> - **上游仓库**：<https://github.com/FuRongJun-1999/dsh-memory>
+> - **本仓库做了什么**：在上游代码之上做了 **11 轮系统性源码优化**（性能 + 三个真实缺陷修复），详见 [本衍生版做了什么](#-本衍生版做了什么11-轮优化) 与 [docs/fork/](docs/fork/)
+> - **署名与许可**：原始版权归 FuRongJun-1999 所有，`LICENSE` **原样保留**；本仓库的改动部分同样以 MIT 发布。完整归属说明见 [NOTICE.md](NOTICE.md)
+> - **提 Issue 前请注意**：与上游本身相关的问题请提到[上游仓库](https://github.com/FuRongJun-1999/dsh-memory/issues)；只有**本仓库引入的改动**相关的问题才提到这里
+>
+> 如果你要的是原版、最新版、或完整功能，请直接使用上游仓库。
+
+---
+
+## 📑 目录
+
+| 章节 | 内容 |
+|---|---|
+| [这是什么](#-这是什么项目用途) | 项目用途、它解决什么问题、和向量记忆库的区别 |
+| [核心功能](#-核心功能) | 记忆读写、四态裁决、语义时空图、隔离与审计 |
+| [技术特点](#-技术特点) | 纯文本真源、零 LLM 裁决、零依赖、可复现 |
+| [使用场景](#-使用场景) | 什么情况下该用它、什么情况下不该用 |
+| [快速上手](#-快速上手) | 环境依赖 → 安装 → 配置 → 运行 → 验证 |
+| [使用示例](#-使用示例) | 可直接复制的写入 / 召回 / MCP 调用示例 |
+| [目录结构](#-目录结构) | 仓库各目录职责一览 |
+| [本衍生版做了什么](#-本衍生版做了什么11-轮优化) | 11 轮优化：目标、改动、实测效果 |
+| [常见问题](#-常见问题上手向) | 上手阶段最常踩的坑 |
+| [参与贡献](#-参与贡献) | 贡献流程与上游同步方式 |
+| [许可协议与归属](#-许可协议与归属) | MIT 与上游归属 |
+| [上游原版完整技术文档](#-上游原版完整技术文档) | 保留的上游 README 全文（评测数据、架构、工具面、开发约定） |
+
+---
+
+## 🎯 这是什么（项目用途）
+
+**灵枢是一套给 AI Agent 用的长期记忆系统。**
+
+它要解决的问题很具体：**AI 助手每次新开会话就失忆**。你跟它讲过的团队约定、项目背景、上次定下的接口方案，下一轮对话它就不记得了。
+
+灵枢的做法是把对话**沉淀成一份人类可读的 Markdown 认知图**——记忆本体就是一堆 `.md` 文档，任何编辑器都能直接打开审阅；「记什么、取什么、能不能写入」全部由**确定性规则**裁决，不靠 LLM 黑箱判断。所以它和主流的向量记忆库（mem0 / MemOS / Zep 等）在路线选择上是**正交**的：
+
+| | 向量记忆库（mem0 / MemOS / Zep） | 灵枢（本项目） |
+|---|---|---|
+| 记忆存储形态 | 嵌入向量 + 数据库 | **纯 Markdown 文档** |
+| 写入是否用 LLM | 用（抽取、摘要、去重） | **不用**（确定性规则） |
+| 能否直接读原文 | 不能（返回改写后的条目） | **能**（原文即真源） |
+| 写入成本 | 数百毫秒 ~ 数百秒 | **0.011–0.019 秒** |
+| 可审计性 | 黑箱（分数不可解释） | **全链路留痕、结果可复现** |
+
+> 一句话：**如果你要的是「答案能不能当证据」，灵枢的原文路线是对的选择；如果你要的是「模糊语义相似度」，向量库更合适。**
+
+---
+
+## ✨ 核心功能
+
+### 记忆读写
+
+| 能力 | MCP 入口 | 说明 |
+|---|---|---|
+| 写入记忆 | `cg(op=write)` / `mdcg_remember` | 须过**三道闸门**，最终判定 `ACCEPT` 才落盘 |
+| 多路融合检索 | `mdcg_recall` / `mdcg_search` | 四路 RRF 融合 + 同义扩展 + terms 字段 |
+| 按 id 取回 | `mdcg_get` | 返回原文，不做改写 |
+| 条件路由 | `cg(op=route)` | 按「生效条件」精确路由，而非模糊匹配 |
+| 时间线回溯 | `stg(op=timeline)` | 语义时空图的时序视图 |
+| 主动遗忘 | `cg(op=forget)` | **只能显式发起**，不做静默淘汰 |
+| 冲突检测 | `cg(op=consistency)` | 发现记忆之间的矛盾 |
+
+### 写入质量闸门（这是灵枢最特别的地方）
+
+- **三道闸门**：`audit`（审计）→ `consistency`（一致性）→ `gated`（三问四态）。任一不过即不落盘。
+- **四态资格**：`ACCEPT` / `REJECT` / `DEFER` / `BLINDSPOT`——不确定时标 `BLINDSPOT` 而非猜测。
+- **`committed` 才是真相**：返回体 `{"ok": true, "committed": false}` 表示**请求被受理但未落盘**，`ok` 只代表受理。
+- **CCG 六要素记忆卡**：`功能名 / 生效条件 / 子功能 / 执行 / 验证方式 / 不适用条件`，缺要素直接 `REJECT` 并给出**完整缺失清单**。
+
+### 隔离、安全与审计
+
+- **会话隔离**：`public` / `internal` 跨会话共享；`private` / `secret` 绑定归属会话。
+- **密级 × 租户**：`MdCGSecure` 提供 clearance（密级）× principal（租户）双重隔离。
+- **可恢复遗忘**：删除走回收站，可 `restore` 恢复，而非硬删。
+- **全链路审计**：每次裁决留痕，`cg(op=audit)` 可回看。
+
+### 上下文自管理
+
+`cg(op=session)` 重要性评分 · 预算装包 · 分层注入 · 记忆自净（`cg(op=scrub)`）——让 Agent 自己管好上下文预算。
+
+---
+
+## 🔧 技术特点
+
+1. **记忆真源 = 纯 Markdown 认知图**
+   `_index.json`、分片日志、读缓存、结构索引**全部是派生物**，任何一层损坏都不污染真源，随时可重建。
+
+2. **写入与裁决零 LLM**
+   纯确定性规则。没有抽取模型、没有嵌入模型、没有判官模型。所以写入是 **0.011–0.019 秒**量级，而抽取式系统是 300–660 秒量级（同基准实测）。
+
+3. **零第三方运行时依赖**
+   `md_cg/` 是**纯 Python 标准库**实现，不需要 `pip install` 任何东西。Node 侧依赖只用于 DSH 插件形态。
+
+4. **中文优先的语义层**
+   项目**明确裁定不上向量嵌入**（见上游 README 的「中英双语检索差距」一节），用中文语义归一化 + 字级原子映射解决跨语言检索。理由是保持「纯词面、可复现、零重依赖」。
+
+5. **跨 harness，不绑定任何 Agent 框架**
+   大脑 `md_cg/` 是一个标准 **stdio MCP server**。任何支持 MCP 的宿主（DSH / Claude Code / Codex CLI / CodeBuddy / ZCode / Cursor…）都能直接挂载。
+
+6. **本衍生版：11 轮系统调用层优化**
+   详见下一节。核心结论一句话：**这套系统的算法层不慢，慢的全是系统调用**——2000 个文件逐次 `open()` 要 2.75 秒，而一次 `os.scandir` 目录枚举把全部 size/mtime/属性免费带回只要 3.9 毫秒（**52×**）。
+
+---
+
+## 🧭 使用场景
+
+### ✅ 适合
+
+- **给 AI 编程助手加长期记忆**——记住团队约定、代码规范、项目决策，跨会话生效。
+- **多智能体共享同一份记忆**——`--serve` 支持多进程并发共享同一份认知图。
+- **需要「答案可溯源到原文」的场景**——合规、审计、法务、医疗等不能接受「模型改写过的记忆」。
+- **中文为主的记忆检索**——中文链路是项目的主设计目标。
+- **需要可复现、可离线**——零外部 API 依赖，写入不调用任何模型。
+- **想要人可读的记忆**——直接 `cat` 或编辑器打开 `.md` 就能看。
+
+### ❌ 不适合
+
+- **需要语义模糊匹配**——本项目明确不做向量检索，同义鸿沟靠词表归一化解决。
+- **超大规模记忆库（十万级以上）**——本衍生版的性能实测基于 2000 节点；万级以上未实测。
+- **想要 SaaS 开箱即用**——这是需要自己部署的基础设施。
+- **完全不懂命令行的使用者**——需要跑 Python 命令、改 JSON/YAML 配置。
+
+---
+
+## 🚀 快速上手
+
+### 环境依赖
+
+| 依赖 | 版本要求 | 是否必需 | 说明 |
+|---|---|---|---|
+| **Python** | **≥ 3.12** | ✅ **必需** | 记忆大脑本体。实测 3.12.10 / 3.13.14 / 3.14.7 通过 |
+| **Node.js** | **≥ 22.19** | ⚠️ 仅插件形态 | 只有用 DSH 插件 / `npx init` 时才需要 |
+| **Rust** | stable | ⚠️ 仅源码树测试 | 跑全量测试套件才需要编译 `rust/` 与 `hive/` |
+| **第三方 Python 包** | —— | ❌ **不需要** | 大脑是纯标准库实现，**零 pip 依赖** |
+
+> **重要**：大脑本体（`md_cg/`）**零第三方依赖**。你不需要建虚拟环境装任何东西，系统 Python 直接可用。
+
+---
+
+### 安装方式一：MCP 直挂（最简，推荐）
+
+适用于**任何支持 MCP 的宿主**（Claude Code / Codex CLI / Cursor / DSH…）。
+
+**① 拿到代码**
+
+```bash
+git clone https://github.com/regdiliKUN/lingshu.git
+cd lingshu
+```
+
+**② 决定记忆库放在哪**
+
+记忆库是一个**目录**，`.md` 认知图会写进去。建议放在仓库**外面**，避免升级代码时丢记忆：
+
+```bash
+# 例（Windows）：C:\Users\<你>\.lingshu\memory
+# 例（Linux/macOS）：~/.lingshu/memory
+mkdir -p ~/.lingshu/memory
+```
+
+**③ 在宿主里注册 MCP server**
+
+把下面这段加进宿主的 MCP 配置（各宿主路径不同：Claude Code 是项目根 `.mcp.json`，Codex CLI 是 `~/.codex/config.toml`，DSH 是 `cordis.yml`）：
+
+```json
+{
+  "mcpServers": {
+    "lingshu": {
+      "command": "python",
+      "args": ["-m", "md_cg.mcp_server"],
+      "cwd": "/绝对路径/到/lingshu",
+      "env": {
+        "MDCG_ROOT": "/绝对路径/到/你的记忆库",
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}
+```
+
+> - **Windows 用 `python`，Linux/macOS 用 `python3`**。
+> - `cwd` 必须是仓库根（`md_cg` 的父目录）。
+> - 路径**一律用绝对路径**，不要写相对路径。
+
+**④ 重启宿主**，然后让 Agent 列出它的工具——应能看到 `cg` 和 `stg`。
+
+---
+
+### 安装方式二：DSH 插件
+
+```bash
+# ① 克隆并构建插件本体
+git clone https://github.com/regdiliKUN/lingshu.git
+cd lingshu
+npm install && npm run build          # tsc → lib/
+
+# ② 装进 DSH profile（走 pnpm 协调，勿用裸 npm install）
+dsh plugin --profile web add .
+
+# ③ 在 <profile>/cordis.yml 启用（配置样例见 dsh/cordis.yml.example）
+```
+
+```yaml
+- id: lingshu-memory
+  name: '@furongjun1999/dsh-memory'
+  config:
+    mdcg:
+      root: ''            # 留空 = 用户级默认位置；换位置请填绝对路径
+    identity: '灵枢'
+    tools: 'core'         # 'core'(默认, 仅 cg/stg) | 'brain' | 'all'
+```
+
+> ⚠️ **不要**用裸 `npm install` 装进 profile——插件有 6 个 `peerDependencies`，必须由 `dsh plugin add` 走 pnpm 解析。
+
+---
+
+### 安装方式三：`npx` 一键生成配置
+
+```bash
+npx @furongjun1999/dsh-memory init
+```
+
+交互式三问（接入端 / 记忆根目录 / Python 解释器）后，产出 MCP 配置片段 `lingshu-mcp-snippet.json` 与后续步骤指引。**只生成配置，不建目录、不启服务、不写库**。
+
+非交互直跑：
+
+```bash
+npx @furongjun1999/dsh-memory init -- --end claude --root /path/to/memory --python python3
+```
+
+---
+
+### 配置步骤
+
+**核心配置只有两项**，都通过环境变量：
+
+| 环境变量 | 作用 | 缺省 |
+|---|---|---|
+| `MDCG_ROOT` | 记忆库根目录（`.md` 认知图落在这里） | 用户级默认位置 |
+| `MDCG_TOKEN` | 写入凭据。**不配 = 只读 `guest`**（读得到、写不进） | 空（只读） |
+
+**签发写入凭据**（让记忆真正落盘）：
+
+```bash
+# 签发令牌（明文不写进配置文件）
+python -m md_cg.tokens issue --role designer --actor lingshu --clearance internal \
+  --ops-allow info,route,read,write,recent,goal,identity,whitebox,verify \
+  --layers-allow knowledge,contextual,structural,self,goals,unresolved,rejected
+
+# 设为环境变量，然后重启宿主
+setx MDCG_TOKEN "mdcg1.xxxxx"        # Windows
+export MDCG_TOKEN="mdcg1.xxxxx"      # Linux/macOS
+```
+
+> `--role recorder` 是最小权限版（只能自动记忆 / 转录）。
+
+**性能相关开关**（都有合理缺省，**通常不用改**）：
+
+| 环境变量 | 作用 | 缺省 |
+|---|---|---|
+| `MDCG_READ_CACHE` | 进程内读缓存 + 落盘旁路缓存 | **开**（`=0` 关） |
+| `MDCG_NODE_SIDECAR` | 只关落盘旁路缓存 | 开 |
+| `MDCG_DIRSCAN` | 目录条目表（免逐路径 stat） | 开 |
+| `MDCG_DIRSCAN_TTL` | 目录表新鲜度窗口（秒） | `1.0` |
+| `MDCG_SCAN_WORKERS` | 冷启动扫描并发度 | 自动（机械盘建议 `=1`） |
+| `MDCG_UNIFY_QUERY` | 统一归一层（英文 query → 中文） | **关** |
+
+---
+
+### 运行方式
+
+```bash
+# ① 直接跑 MCP server（stdio JSON-RPC，挂到宿主时由宿主拉起）
+python -m md_cg.mcp_server
+
+# ② 只读配置自检（排查路径 / 策略问题时先跑这个）
+python -m md_cg.mcp_server --show-config
+
+# ③ 多智能体并发共享同一份记忆
+python -m md_cg.mcp_server --serve
+```
+
+### 首次验证
+
+**A. 大脑连通性**——收到 initialize 应答即通：
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | python -m md_cg.mcp_server
+```
+
+**B. 全量测试套件**（可选，需 Rust 工具链）：
+
+```bash
+python -m md_cg.run_tests md_cg --jobs 4        # 从仓库根运行
+python -m md_cg.run_tests md_cg --list          # 先看有哪些用例
+python -m md_cg.run_tests md_cg -k <关键字>      # 定向跑
+```
+
+> ⚠️ **必须从仓库根运行，且必须用 `python -m`**——`md_cg/` 内普遍使用包内相对导入，直接 `python md_cg/test_xxx.py` 会 `ImportError`。
+> ⚠️ **不要和其它重负载任务并行跑**——套件会吃满 CPU，会把慢用例顶成超时假红。
+
+---
+
+## 💡 使用示例
+
+### 示例 1：让 Agent 记住一件事
+
+你只需要**正常对话**：
+
+```
+你：请记住：我们团队的发布窗口是每周三下午 3 点。
+
+Agent（背后）：cg(op=write) → 过三道闸门 → 认知图节点落盘
+              返回 {"ok": true, "committed": true}
+```
+
+**新开一个会话**后：
+
+```
+你：我们的发布窗口是哪天？
+
+Agent（背后）：mdcg_recall 自动召回命中 → 带入回答
+```
+
+### 示例 2：写入带 CCG 六要素的结构化记忆
+
+```bash
+# text 类写入必须带六要素，否则被 REJECT（并在 verdict.detail.missing 给出缺失清单）
+```
+
+```
+cg(op=write, content_kind="text", content="
+# 功能名：发布窗口
+# 生效条件：讨论到发布节奏或上线时间时
+# 子功能：团队每周三下午 3 点统一发布
+# 执行：周三 15:00 前完成发布检查清单
+# 验证方式：查看团队日历上的「发布窗口」事件
+# 不适用条件：紧急热修不受此窗口限制
+")
+```
+
+### 示例 3：用可验证类型绕过审核直接落盘
+
+```bash
+cg(op=write, content_kind="code", content="def add(a, b): return a + b")
+# code 类型只要 AST 解析通过即 ACCEPT
+```
+
+### 示例 4：MCP 工具直调（宿主侧）
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call",
+ "params":{"name":"mdcg_recall",
+           "arguments":{"query":"发布窗口是哪天","budget_tokens":2000,"k":20}}}
+```
+
+---
+
+## 📁 目录结构
+
+```
+lingshu/
+├── md_cg/              🧠 记忆本体（大脑）——纯 Python 标准库，零第三方依赖
+│   ├── mdcg.py             认知图基类：索引、节点读写、资格判定、检索
+│   ├── mdcos.py            记忆 OS 能力层：RRF 检索/审计/回收站/会话/治理 + 密级隔离
+│   ├── mcp_server.py       stdio MCP 服务器（工具面 cg / stg / mdcg_*）
+│   ├── readcache.py        读缓存装配层
+│   ├── run_tests.py        全量测试入口（包内，出货面唯一可用入口）
+│   ├── semantic/           中文语义层（词表、原子映射、复现说明）
+│   └── test_*.py           测试用例（300+ 个）
+├── rust/               ⚙️ Rust 检索引擎：零依赖三形态（库内嵌 / --serve / 评测器）
+├── hive/               ⬢ 蜂巢并发引擎：worker 池、原子领取、心跳、崩溃恢复
+├── swarm/              🐝 蜂群运行时：.pbc 实例、Gossip 拓扑、WAL-HMAC
+├── compiler/           📜 术数编译器：词法→语法→名实校验→代码生成→验证终裁
+├── src/                🔌 TypeScript 插件本体（DSH 插件形态，编译产物在 lib/）
+├── data/               📊 策略文件 + 公开评测数据集
+│   ├── policy.json         写入策略（CCG 六要素要求、禁表）
+│   └── benchmarks/         locomo-zh-500 · bench6-100-zh-en
+├── docs/               📚 文档（按工程域分目录，索引见 docs/README.md）
+│   └── fork/               ⭐ 本衍生版专属文档（11 轮优化报告）
+├── dsh/ codebuddy/     🔗 各 harness 接入配置与纪律注入
+│   zcode/ codex/ claude/
+├── skills/             🛠 可复用技能（含设计者视角元技能）
+├── scripts/            🔧 源码树工具（发布门禁、渲染、校验）——不入 npm 包
+├── test/               🧪 跨语言集成测试（TypeScript）
+├── .github/workflows/  ⚙️ 8 条 CI 流水线
+├── LICENSE             MIT（原始版权 FuRongJun-1999，原样保留）
+├── NOTICE.md           归属与改动声明
+├── CHANGELOG.md        变更记录
+├── CONTRIBUTING.md     贡献指南
+└── README.md           本文件
+```
+
+> **出货面 vs 源码树**：npm 包只含 `lib/ src/ md_cg/ skills/ README.md dsh/ codebuddy/ zcode/ docs/`。
+> `scripts/`、`hive/`、`swarm/`、`compiler/`、`rust/` 属**源码树**，装出来的插件里不存在。
+
+---
+
+## ⚡ 本衍生版做了什么（11 轮优化）
+
+> 完整报告：[docs/fork/十一轮源码优化报告.md](docs/fork/十一轮源码优化报告.md)
+
+**核心洞察**：这套系统的算法层不慢，**慢的全是系统调用**。2000 个文件逐次 `open()+read` 要 2751 ms，而一次 `os.scandir` 目录枚举把全部 size/mtime/属性免费带回只要 3.9 ms——**52×**。所以优化的唯一主线是：**把「逐文件系统调用」换成「一次目录枚举 + 一次落盘快照」**，并且全程保持**检索结果逐位不变**。
+
+### 实测效果（2000 节点库，min-of-N，同会话串行）
+
+| 指标 | 上游原始 | 本衍生版 | 提升 |
+|---|---:|---:|---|
+| 首次冷启动 | 1681.4 ms | **537.1 ms** | **3.1×** |
+| 快照丢失后恢复装载 | 1618.8 ms | **73.1 ms** | **22.1×** |
+| 热启动后首次检索 | 878.0 ms | **123.1 ms** | **7.1×** |
+| 路径解析段 | 169.8 ms | **6.1 ms** | **28×** |
+| 全量重建索引 | 1594.8 ms | **79.7 ms** | **20×** |
+| 首次检索 `.md` open 次数 | 2000 | **0** | 归零 |
+| 路径解析 `realpath` 次数 | 2000 | **3** | 归零 |
+
+### 十一轮一览
+
+| 轮次 | 目标 | 关键改动 |
+|---|---|---|
+| R1 | 消除 O(N) 符号链接解析 | 目录级 realpath 缓存 |
+| R2 | 首次检索零 open | 正文旁路缓存 `_nodecache.json`（独立文件，不污染索引） |
+| R3 | 消除逐节点 stat / islink | 目录条目表（`os.scandir` 一次枚举，TTL 1 s） |
+| R4 | 冷启动也免 open | 扫描复用旁路缓存 |
+| R5 | 修补路径穿越（上游 issue #172） | `_trash_path` 单点闸门 |
+| R6 | 证伪裁决改为可恢复（上游 issue #144） | `_retire_path` 走回收站而非硬删 |
+| R7 | 旁路缓存健壮性 | 三重规模上限 + 9 种坏档自愈 |
+| R8 | 冷启动并发读盘 | 三遍扫描 + 线程池（3.6×） |
+| R9 | **回归修复**（把「快」换回「对」） | 修掉 R4 引入的真 bug + 2 处纪律违规 |
+| R10 | **生产类双读归零** | `MdCGSecure` 真冷启动从 2N 次 open 降到 N 次 |
+| R11 | **接线缺陷订正** | `direct_read` 未穿透缓存（被掩盖 9 轮的真实缺陷） |
+
+### 后三轮挖出的三个真实缺陷
+
+- **R9**：`consolidate` 直写文件不走脏标记 → 扫描拿到写前旧 stat → **新正文被旧旁路缓存顶掉**。
+- **R10**：生产路径用的 `MdCGSecure` 覆写了 `_scan_nodes`，在 `super()` 之后**逐节点再读一遍** → **真冷启动 2N 次 open**。（第一版改读路径的做法因破坏「读不到就不给」的 fail-closed 语义而**已回退**，最终改在扫描面传递。）
+- **R11**：`direct_read`（治理面「写前重查」的唯一真源）实际**没有**穿透缓存——会读到陈旧正文并**静默覆盖**另一实例的修正。该缺陷被掩盖 9 轮。
+
+### 验证与诚实边界
+
+- **结果等价性**：优化全开 vs 全关，8 组查询 ×（id, score, 资格状态）、recall id 序列、400 个索引键、400 个内容哈希——**逐位一致**。
+- **全量测试**：`317/327 通过 · 3 跳过 · 10 失败`；10 项**全部落在上游基线失败集合内** ⇒ **新增失败 0**。**未修改任何测试文件**。
+- **诚实边界**：① 读数基于**合成 2000 节点库**，万级未实测；② 本机墙钟噪声 ±15~30%，故以**系统调用计数**为主证；③ 改动**未提交到上游**，本仓库以独立提交形式携带。
+
+---
+
+## ❓ 常见问题（上手向）
+
+<details>
+<summary><b>装完什么都没发生 / Agent 看不到记忆工具？</b></summary>
+
+按顺序排查：① **重启宿主**（MCP server 是长驻进程，新增配置必须重启才加载）；② 检查 MCP 配置里的 `cwd` 是不是仓库根、`command` 是不是 `python`（Windows）/ `python3`（Linux·macOS）；③ 跑 `python -m md_cg.mcp_server --show-config` 看路径解析是否正常；④ 看宿主日志里有没有 `spawn ... ENOENT`——**那是第一因**（解释器名与平台不匹配），「调用超时」只是次生现象。
+</details>
+
+<details>
+<summary><b>说了「请记住」，但它没记住？</b></summary>
+
+看返回体的 **`committed` 字段**，不要看 `ok`：
+
+```
+{"ok": true, "committed": false, "moved_to": "review_queue"}   ← 受理了，但没落盘
+```
+
+三个最常见原因：① **没配 `MDCG_TOKEN`** → 只读 `guest`，写入不落盘；② `content_kind` 是 `text` 但**缺 CCG 六要素** → `REJECT`；③ 没过三道闸门。
+</details>
+
+<details>
+<summary><b>为什么 `python md_cg/test_xxx.py` 报 ImportError？</b></summary>
+
+`md_cg/` 内普遍使用**包内相对导入**，必须以模块方式从**仓库根**运行：
+
+```bash
+python -m md_cg.test_xxx          # ✅
+python md_cg/test_xxx.py          # ❌ ImportError
+```
+</details>
+
+<details>
+<summary><b>控制台里中文显示成乱码，数据坏了吗？</b></summary>
+
+**没坏。** 这是 Windows 控制台按代码页（cp936）解释 UTF-8 字节的**显示层**问题，字节一个都没丢。本仓库**一切按 UTF-8 字节判定**，不做控制台兼容。取用数据请走 `python -X utf8 …`，不要拿终端当数据通道。
+</details>
+
+<details>
+<summary><b>升级代码后报 ImportError: cannot import name ...？</b></summary>
+
+长驻 MCP 进程停在旧代代码上。**重启宿主即可**，记忆数据无损。自检：对运行中的 server 调 `cg(op=info)`，看 `stale_on_disk` / `restart_required` 两个字段。
+</details>
+
+<details>
+<summary><b>这套优化会不会改变我的检索结果？</b></summary>
+
+**不会。** 优化全开与全关的结果**逐位一致**（8 组查询的 id/分数/资格状态、recall 序列、400 个索引键、400 个内容哈希）。任一层出问题都能用环境变量整体退回，且**退回后语义零变化**。
+</details>
+
+<details>
+<summary><b>我该用这个衍生版还是上游原版？</b></summary>
+
+- **要最新功能 / 最全能力 / 官方支持** → 用[上游原版](https://github.com/FuRongJun-1999/dsh-memory)。
+- **只关心首次装载与检索的启动速度，或需要 R5/R6 的安全闸** → 本衍生版。
+- 本衍生版基线是上游 `958097d`，**不包含此后上游的新提交**。
+</details>
+
+---
+
+## 🤝 参与贡献
+
+见 [CONTRIBUTING.md](CONTRIBUTING.md)。要点：
+
+1. **先开 Issue 讨论**再提 PR，避免白做工。
+2. 改动请**附上验证证据**（本项目重视「能红的守卫测试」）。
+3. **不要修改测试文件来让测试通过**——本项目用「改实现」解决回归。
+4. 与上游同步：
+
+```bash
+git remote add upstream https://github.com/FuRongJun-1999/dsh-memory.git
+git fetch upstream
+git merge upstream/main        # 注意：本仓库的优化改动可能与上游冲突
+```
+
+---
+
+## 📄 许可协议与归属
+
+- **上游项目**：[FuRongJun-1999/dsh-memory](https://github.com/FuRongJun-1999/dsh-memory)，作者 **符荣峻（FuRongJun-1999）**，**MIT License**。
+- **本仓库**：上游的优化衍生版，改动部分同样以 **MIT** 发布。
+- `LICENSE` 文件**原样保留上游版权声明**（MIT 的要求）。完整归属与改动说明见 [NOTICE.md](NOTICE.md)。
+- DeepSeek Harness 为 DeepSeek 官方开源项目（MIT），与本项目**无隶属关系**。
+
+---
+
+## 📖 上游原版完整技术文档
+
+> 以下为**上游 README 全文，原样保留**（含评测数据、架构说明、完整工具面、开发约定与工程纪律）。
+> 如需最新版本，请访问 <https://github.com/FuRongJun-1999/dsh-memory>。
+> 其中涉及上游仓库的链接、Issue 编号与 Release 说明，均指向上游项目。
+
+<br />
+
+---
+---
+
+<div align="center">
+
 # 灵枢 LINGSHU
 
 ### 让 AI Agent 拥有不可遗忘的记忆

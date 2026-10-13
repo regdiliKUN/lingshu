@@ -1,0 +1,52 @@
+# EditorConfig · https://editorconfig.org
+#
+# 本仓库的文本约定：**一律 UTF-8（无 BOM）**，换行以 LF 为准。
+# 参见 .gitattributes（sh / yml / yaml 已钉死 LF）。
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Markdown 的行尾双空格是有意义的换行语法，不能裁剪
+[*.{md,markdown}]
+trim_trailing_whitespace = false
+
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.{js,mjs,cjs,ts,tsx,json,jsonc}]
+indent_style = space
+indent_size = 2
+
+[*.py]
+indent_style = space
+indent_size = 4
+max_line_length = 120
+
+[*.rs]
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+[*.toml]
+indent_style = space
+indent_size = 2
+
+[*.sh]
+indent_style = space
+indent_size = 2
+
+[Makefile]
+indent_style = tab
+
+[*.{bat,cmd}]
+end_of_line = crlf
+
+[*.{png,jpg,jpeg,gif,ico,webp,pdf,zip,tar,gz}]
+insert_final_newline = false
+trim_trailing_whitespace = false

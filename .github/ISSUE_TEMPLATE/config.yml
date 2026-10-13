@@ -1,0 +1,22 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: 🔐 报告安全漏洞（私密渠道）
+    url: https://github.com/regdiliKUN/lingshu/security/advisories/new
+    about: 请勿通过公开 Issue 报告安全漏洞，请使用私密漏洞报告。
+
+  - name: ⬆️ 上游项目 · FuRongJun-1999/dsh-memory
+    url: https://github.com/FuRongJun-1999/dsh-memory
+    about: 本仓库是上游的优化衍生版。上游本身的功能、缺陷、评测数据与最新版本请看这里。
+
+  - name: 🐛 上游 Issues（上游自身的问题提到这里）
+    url: https://github.com/FuRongJun-1999/dsh-memory/issues
+    about: 如果你的问题与「本仓库的 11 轮优化改动」无关，请提到上游仓库。
+
+  - name: 📚 本仓库文档
+    url: https://github.com/regdiliKUN/lingshu#-目录
+    about: README 门户段（快速上手 / 目录结构 / 常见问题）与 docs/ 文档索引。
+
+  - name: ⚡ 十一轮优化报告
+    url: https://github.com/regdiliKUN/lingshu/blob/main/docs/fork/十一轮源码优化报告.md
+    about: 本衍生版相对上游的全部改动：逐轮目标 / 改动 / 效果对比 / 验证证据 / 诚实边界。
