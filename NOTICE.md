@@ -30,7 +30,8 @@
 | `md_cg/readcache.py` | 17 | 1 |
 | **合计** | **769** | **57** |
 
-**未修改任何测试文件。**
+**十一轮优化未修改任何测试文件。**（`opt.3` 为修 §8.4 的三项恒红，另行改动了 **4 个测试文件**——
+那是独立于十一轮优化的一批改动，见 §8.4「修法」表。）
 
 ### 改动性质
 
@@ -121,7 +122,7 @@
 ## 8. 本衍生版发现的上游缺陷（如实记录）
 
 在为本仓库配置 CI 与同步上游的过程中，跑出了**四个属于上游、不是本衍生版引入**的问题。
-两个已在本仓库订正，一个本仓库修不了（因为它在上游**已发布的 npm 产物**里），一个**刻意保留红灯**。
+**三个已在本仓库订正**，一个本仓库修不了（因为它在上游**已发布的 npm 产物**里）。
 **四个都已上报上游**，附可复现证据。`§8.5` 记录由 `§8.4` 直接推导出的分支保护配置决定：
 
 | # | 缺陷 | 本仓能否修 | 上游 issue |
@@ -129,7 +130,7 @@
 | 8.1 | `install-verify` 的 `npm ls` 诊断步必然杀整步 | ✅ 已订正 | [#223](https://github.com/FuRongJun-1999/dsh-memory/issues/223) |
 | 8.2 | npm 包干净安装后无法 import（optional peer 被静态导入） | ❌ 修不了（在已发布 tarball 里） | [#222](https://github.com/FuRongJun-1999/dsh-memory/issues/222) |
 | 8.3 | `prepare` 误伤 `npm pack --dry-run`，致上游发版门禁恒红 | ✅ 已订正 | [#221](https://github.com/FuRongJun-1999/dsh-memory/issues/221) |
-| 8.4 | `python-tests` 3 项恒红：#179 判据误报 + 两项 Windows-only 断言 | 📌 **刻意保留红灯**（修它需改测试文件，违背本仓「零测试改动」承诺） | [#234](https://github.com/FuRongJun-1999/dsh-memory/issues/234) |
+| 8.4 | `python-tests` 3 项恒红：#179 判据误报 + 两项 Windows-only 断言 | ✅ 已订正（`opt.3`；**撤销** `opt.2` 的「零测试改动」取舍，详见 §8.4） | [#234](https://github.com/FuRongJun-1999/dsh-memory/issues/234) |
 
 ### 8.1 已订正：`install-verify` 的 `npm ls` 诊断步必然杀整步
 
@@ -217,7 +218,7 @@ else if (process.env.npm_config_dry_run === 'true') {
 | `npm pack --dry-run`（门禁取清单） | `exit 1` ⇒ 门禁 `exit 2` 恒红 | **`exit 0`**，门禁 R1–R7 全绿 |
 | `npm run prepare`（真实安装路径） | `exit 1`（报 #161） | **`exit 1`（报 #161，逐字不变）** |
 
-### 8.4 **刻意保留红灯**：`python-tests` 在 `4169c5bd` 上有 3 项恒红（全部继承自上游）
+### 8.4 已订正：`python-tests` 在 `4169c5bd` 上的 3 项恒红（全部继承自上游）
 
 > 上游已上报：[#234](https://github.com/FuRongJun-1999/dsh-memory/issues/234)
 
@@ -238,16 +239,25 @@ else if (process.env.npm_config_dry_run === 'true') {
 | ② | `md_cg.whitebox_kb.wisdom.test_ecosystem_assembly` | 测试里硬编码 Windows 分隔符 `io.open(f'{TOOLS}\\{fn}')`，POSIX 上 `\\` 是真实文件名字符 ⇒ `FileNotFoundError`。**它到现在才红是因为上游 #185 把 md_cg 收集面从非递归改成递归**——子目录测试此前根本不在收集面内（既不是红也不是绿，是**不存在**） | **PASS** |
 | ③ | `md_cg.test_issue211_export_target` 的 U10 | 该断言的前提是「末段 `aux` 命中 Windows 保留设备名 ⇒ `datapath.aux_root()` 解析失败」，POSIX 上 `aux` 只是普通目录名 ⇒ 断言**不可能成立** | **PASS** |
 
-**为什么刻意不修**：②③ 的修法是**改测试文件**（`os.path.join` / 平台前置 SKIP），而本衍生版对外的
-承诺是「**未修改任何测试文件**」——这条承诺的价值高于「让徽章变绿」。① 的修法是改守卫判据，
-但即便修掉它，②③ 仍会让这条流水线恒红，**买不到绿**。
+**修法（未发布修复，2026-10-14）**：
 
-**因此本仓不把 `run-tests` 设为分支保护的必需检查**：一条恒红的检查作为必需条件，
-会让「满足条件」成为不可能，等于把门禁变成墙。
+| 项 | 改动 | 保留的判据 |
+|---|---|---|
+| ① 路径守卫 | 以 `shlex` 解析静态 shell 参数；保留脚本路径的引号语义，排除 Node/Python 内联源码与输出文字，递归解析 shell `-c`；还原 workflow 的 YAML 外层引号 | 真实缺失路径仍退 4；词法解析失败退 2。新增回归在中断草稿上 7 项失败，修后全部通过 |
+| ② 生态组装测试 | `os.path.join` 拼路径；用 AST 提取六域的单元字典键，与正式注册表逐域核对 | 686 个单元名称一致；漏登记、错登记、重复单元名都失败。旧正则漏掉六个单元且仅打印失败，已修 |
+| ③ 导出安全测试 | Windows 用真实保留名误配置；POSIX 注入 `aux_root()` 抛 `ValueError` | 两平台均必须收到 `PermissionError` 与「辅助存储根无法解析」，未跳过契约 |
 
-> 方法论：**关掉/绕过一条恒红的检查，与把它修好，是两件事。** 本仓选择第三条路——
-> **保留红灯 + 逐项根因 + 上报上游**，并明确标注「这条流水线当前不携带信号」。
-> 这比「把 3 项失败写成 `continue-on-error`」诚实，也比「默默不管」有用。
+**本次新增发现**：Windows 进程探测的 `Format-List` 输出中，命令行可以跨行且包含空行、冒号。旧解析把续行当成伪记录，使 `list/purge/kill` 的探测失效。现以顶格 `ProcessId` 开始记录，续行保留在命令行；未知顶格文本仍判环境错误。两条新回归修前失败，修后含沙盒端到端验证 28/28 通过。
+
+**更正中断草稿**：shell 可以执行带引号的命令和脚本路径，不能把所有引号内容删除。
+之前草稿声称「必须不加引号才能执行」是错误的；那种修法会遗漏真实缺失脚本，现已替换。
+这里的守卫只检查静态脚本路径，不是完整的 shell/JS/Python 分析器，不推断动态生成的路径或源码内的 import。
+
+**修订测试政策**：十一轮优化本身未改测试；本次修复另改四份测试。测试错误同样需要修正，
+必须用复现证据说明原判据哪里错误，并保留或加强真实行为断言。不能为了通过而删断言、吞异常或放宽退出码。
+
+本机 Windows / Python 3.12：导出安全测试 33/33、生态组装测试 686 个单元逐域一致；
+全量结果请查本次修复分支对应提交的 GitHub Actions。`opt.3` 尚未打 tag。
 
 **`opt.2` 推送后的 CI 实测（`39d69df1`，2026-10-13）**：
 
@@ -264,7 +274,7 @@ else if (process.env.npm_config_dry_run === 'true') {
 | `allow_force_pushes` | **false** | 防误 `--force` 改写已发布历史 |
 | `allow_deletions` | **false** | 防误删 `main` |
 | `enforce_admins` | **true** | 让上述两条**对管理员也生效**——否则保护对仓库所有者形同虚设（文档原文：默认「the restrictions of a branch protection rule don't apply to people with admin permissions」） |
-| `required_status_checks` | **未设置** | **刻意**：当前唯一「每次推送都跑」的检查 `run-tests` 是恒红的（§8.4），把它设为必需会让「满足条件」成为不可能 = **把门禁变成墙**。待上游修掉那 3 项后应补上 |
+| `required_status_checks` | **未设置** | 启用时（`opt.2`）的唯一理由：当前唯一「每次推送都跑」的检查 `python-tests` 是恒红的（§8.4），把它设为必需会让「满足条件」成为不可能 = **把门禁变成墙**。本次修复后需以全量 CI 结果复核；必需检查尚未变更 |
 | `required_pull_request_reviews` | 未设置 | 单人仓库，无需评审 |
 | `restrictions`（可推送人） | 未设置 | **不限制正常推送**——保护只拦 force-push 与删除，`git push` 正常工作 |
 
@@ -277,4 +287,4 @@ else if (process.env.npm_config_dry_run === 'true') {
 
 ---
 
-_Last updated: 2026-10-13_
+_Last updated: 2026-10-14_

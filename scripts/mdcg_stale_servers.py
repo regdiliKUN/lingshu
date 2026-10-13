@@ -149,19 +149,29 @@ def _ps(argv_ps: str, timeout: int = 60):
     return (r.stdout or "") + (r.stderr or ""), r.returncode
 
 
-# 生效条件：text 为 Format-List 形态文本（空行分隔的记录块、每块 "Key : Value" 行）时解析为 dict 列表，键值均 strip；无 ":" 的行与空块被跳过，因此输入为空串时返回空列表而不报错。
+# 生效条件：解析 PS_QUERY 的 Format-List 输出；以顶格 ProcessId 开始新记录，缩进续行归 CommandLine，未知顶格文本保留为无效记录供 probe fail-closed。
 def _parse_ps(text: str) -> list:
     procs, cur = [], {}
+    fields = {"ProcessId", "ParentProcessId", "Name", "CreationDate", "CommandLine"}
     for ln in text.split("\n"):
         s = ln.rstrip("\r")
         if not s.strip():
-            if cur:
-                procs.append(cur)
-                cur = {}
+            # 命令行自身可含空行；不能据此截断一个真实进程。
             continue
-        if ":" in s:
+        if not s[0].isspace() and ":" in s:
             k, v = s.split(":", 1)
-            cur[k.strip()] = v.strip()
+            k = k.strip()
+            if k in fields:
+                if k == "ProcessId" and cur:
+                    procs.append(cur)
+                    cur = {}
+                cur[k] = v.strip()
+                continue
+        if s[0].isspace() and "CommandLine" in cur:
+            cur["CommandLine"] += "\n" + s.strip()
+        else:
+            # 未知输出不能静默丢弃，否则错误文本会被解释成「没有进程」。
+            procs.append({"unparsed": s})
     if cur:
         procs.append(cur)
     return procs

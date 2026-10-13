@@ -155,6 +155,11 @@ def main():
             (("", 0), False, "输出为空"),
             ((_PS_PSEUDO, 0), False, "伪记录（<ERR 文本被解析成记录）"),
             ((_PS_OK, 0), True, "正常 Format-List 输出"),
+            ((_PS_OK.rstrip() + '\n               line one\n\n'
+              '               value: with colon\n\n'
+              'ProcessId : 4343\nParentProcessId : 1\nName : node\n'
+              'CreationDate : 2026/10/05 10:00:00\nCommandLine : node worker.js\n', 0),
+             True, "CommandLine 多行含空行与冒号，仍是两条真实记录"),
         ]
         for (ret, usable, label) in cases:
             mod._ps = lambda *a, _r=ret, **k: _r
@@ -164,6 +169,14 @@ def main():
                       err is None and bool(rows), (rows, err))
             else:
                 check("G1 %s → 判不可用（err 非 None）" % label, bool(err), (rows, err))
+
+        multiline = (_PS_OK.rstrip() + '\n               extra: argument\n\n'
+                     '               md_cg.mcp_server\n')
+        mod._ps = lambda *a, **k: (multiline, 0)
+        rows, err = probe()
+        check("G1 命令行续行不变成伪属性，空行不拆进程",
+              err is None and len(rows) == 1 and rows[0]['ProcessId'] == '4242'
+              and 'extra: argument' in rows[0]['CommandLine'], (rows, err))
 
     print("[2] G2 沙盒 E2E·探测不可用（修前：判绿 + 自报被删光）")
     with tempfile.TemporaryDirectory() as sandbox:

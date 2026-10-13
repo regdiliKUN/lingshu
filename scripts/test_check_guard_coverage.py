@@ -94,6 +94,42 @@ def run(mutate: str) -> int:
        bool(gc) and gc[0]["state"] == "covered_test", str(gc[0]["state"]) if gc else "缺失")
 
     if mutate == "":
+        # 生效条件：静态点名检查必须保留引号包裹的真实脚本，忽略解释器内的提示文字。
+        cases = [
+            ('python "scripts/gone.py"', {"scripts/gone.py"}),
+            ("python 'scripts/gone.py'", {"scripts/gone.py"}),
+            ('node "scripts/gone.mjs"', {"scripts/gone.mjs"}),
+            ('node -e "console.error(\'missing lib/index.js\')"', set()),
+            ('python -c "print(\'lib/index.js\')"', set()),
+            ('echo "missing lib/index.js"', set()),
+            ('node -e "console.log(\'lib/index.js\')" && python "scripts/gone.py"',
+             {"scripts/gone.py"}),
+            ('sh -c \'python "scripts/gone.py"\'', {"scripts/gone.py"}),
+            ('python /tmp/scripts/gone.py', set()),
+            ('env PYTHONUTF8=1 python3.12 "scripts/gone.py"\nnode scripts/next.cjs',
+             {"scripts/gone.py", "scripts/next.cjs"}),
+            ('node --eval="console.log(\'lib/index.js\')"', set()),
+        ]
+        for command, expected in cases:
+            actual = mod.named_paths_in(command)
+            ok("命令路径解析 " + command, actual == expected, repr(actual))
+        with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
+            json.dump({"scripts": {"gate": 'python "scripts/gone.py"',
+                                   "prepare": 'node -e "console.error(\'lib/index.js\')"'}}, fh)
+        with open(os.path.join(tmp, ".github", "workflows", "w.yml"), "w", encoding="utf-8") as fh:
+            fh.write('run: \'python "scripts/also_gone.py"\'\n')
+        missing = mod.missing_named_paths(tmp)
+        ok("包脚本与 YAML 引号里的缺失脚本都必须被抓",
+           missing == ["scripts/also_gone.py", "scripts/gone.py"], repr(missing))
+        missing_info = {"bad_registry": [], "orphans": [], "missing_named": missing}
+        ok("缺失脚本仍使守卫退出 4", mod.exit_code(missing_info) == 4)
+        for command in ('python "scripts/gone.py', 'node -e'):
+            try:
+                mod.named_paths_in(command)
+            except ValueError:
+                ok("无法解析的命令必须 fail-closed " + command, True)
+            else:
+                ok("无法解析的命令必须 fail-closed " + command, False)
         bad = tempfile.mkdtemp(prefix="guardcov_nopj_")
         try:
             mod.build(bad)
