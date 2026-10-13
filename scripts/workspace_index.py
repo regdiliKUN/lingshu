@@ -89,6 +89,11 @@ DIR_ROLES = {
 ROOT_FILES = {
     "README.md": "对外主入口（定位 / 核心亮点 / 平台全景 / 接入 / 评测 / 纪律）",
     "LICENSE": "许可",
+    "NOTICE.md": "归属与改动声明（衍生版相对上游的署名与改动清单）",
+    "CHANGELOG.md": "变更记录（本衍生版相对上游的改动，Keep a Changelog 格式）",
+    "CONTRIBUTING.md": "贡献指南（含上游工程约定的硬性要求）",
+    "SECURITY.md": "安全策略（威胁模型 / 内置防线 / 已修补问题）",
+    "CODE_OF_CONDUCT.md": "行为准则（Contributor Covenant 2.1 改编）",
     "package.json": "npm 包清单（@furongjun1999/dsh-memory，bin 入口与脚本）",
     "package-lock.json": "npm 锁文件（npm ci 可复现）",
     "tsconfig.json": "TypeScript 编译配置（src/ → lib/）",
@@ -96,6 +101,7 @@ ROOT_FILES = {
     "discussion-post.md": "对外讨论帖留档",
     ".gitignore": "忽略面（本地数据面 / 实验产物 / 构建产物）",
     ".gitattributes": "换行归一（pre-commit 钩子等须 LF 的文件）",
+    ".editorconfig": "编辑器统一配置（UTF-8 无 BOM · LF）",
     "utf8_boot.py": "入口自保证 UTF-8 的单点助手（纯 stdlib、零 md_cg 依赖；"
                     "七个进程入口在任何 I/O 之前调用）",
 }
