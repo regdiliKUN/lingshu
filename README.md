@@ -13,9 +13,10 @@
 ![Fork](https://img.shields.io/badge/Fork%20of-FuRongJun--1999%2Fdsh--memory-8A2BE2)
 ![Optimization](https://img.shields.io/badge/%E4%BC%98%E5%8C%96-11%20%E8%BD%AE-orange)
 
-![cogmap-check](https://github.com/regdiliKUN/lingshu/actions/workflows/cogmap-check.yml/badge.svg)
-![publish-artifact-check](https://github.com/regdiliKUN/lingshu/actions/workflows/publish-artifact-check.yml/badge.svg)
-![workspace-index-check](https://github.com/regdiliKUN/lingshu/actions/workflows/workspace-index-check.yml/badge.svg)
+![python-tests](https://github.com/regdiliKUN/lingshu/actions/workflows/python-tests.yml/badge.svg?branch=main)
+![cogmap-check](https://github.com/regdiliKUN/lingshu/actions/workflows/cogmap-check.yml/badge.svg?branch=main)
+![publish-artifact-check](https://github.com/regdiliKUN/lingshu/actions/workflows/publish-artifact-check.yml/badge.svg?branch=main)
+![workspace-index-check](https://github.com/regdiliKUN/lingshu/actions/workflows/workspace-index-check.yml/badge.svg?branch=main)
 
 </div>
 
