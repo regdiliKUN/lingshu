@@ -258,6 +258,12 @@ npx @furongjun1999/dsh-memory init
 npx @furongjun1999/dsh-memory init -- --end claude --root /path/to/memory --python python3
 ```
 
+> ⚠️ **`npx` 这条路当前会失败**——它拉的是 registry 上**上游已发布的包**，而该包有一个
+> 未声明的 peer 依赖（`ERR_MODULE_NOT_FOUND: @deepseek-ai/schemastery`）。绕过办法与根因
+> 见 [FAQ](#-常见问题上手向) 与 [NOTICE.md §8.2](NOTICE.md)。
+> **本衍生版不发布 npm 包**，故推荐走**方式一（MCP 直挂）**或**方式二（从本仓构建插件）**，
+> 两者都不依赖 registry 上那个 tarball。
+
 ---
 
 ### 配置步骤
@@ -555,6 +561,31 @@ python md_cg/test_xxx.py          # ❌ ImportError
 <summary><b>这套优化会不会改变我的检索结果？</b></summary>
 
 **不会。** 优化全开与全关的结果**逐位一致**（8 组查询的 id/分数/资格状态、recall 序列、400 个索引键、400 个内容哈希）。任一层出问题都能用环境变量整体退回，且**退回后语义零变化**。
+</details>
+
+<details>
+<summary><b>用 npm 装插件形态后，报 <code>ERR_MODULE_NOT_FOUND: @deepseek-ai/schemastery</code>？</b></summary>
+
+**这是上游已发布 npm 包的一个真实缺陷，不是你的环境问题**（本衍生版已定位，详见 [NOTICE.md §8.2](NOTICE.md)）：
+
+```
+ESM FAIL: ERR_MODULE_NOT_FOUND  Cannot find package '@deepseek-ai/schemastery'
+  imported from .../node_modules/@furongjun1999/dsh-memory/lib/index.js
+```
+
+`@deepseek-ai/schemastery` 在包里是 **`optional: true` 的 peer 依赖**（`dependencies` 为空），
+而入口 `src/index.ts` 对它做的是**静态顶层导入**——npm 7+ 不会自动安装标记为 optional 的
+peer 依赖，于是干净安装后**任何** import 都失败。
+
+**绕过办法**（手动把那个 peer 包补上即可）：
+
+```bash
+npm install @furongjun1999/dsh-memory @deepseek-ai/schemastery
+```
+
+> 该缺陷位于 registry 上**上游已发布的 tarball** 里，本衍生版不发布 npm 包，改本仓库代码
+> 无法影响它。本仓库的 CI 有一条 `install-verify` 会**持续把这条红灯亮着**——这是有意的，
+> 不把检查改成通过等于藏掉一个真缺陷。
 </details>
 
 <details>

@@ -105,4 +105,50 @@
 
 ---
 
+## 8. 本衍生版发现的上游缺陷（如实记录）
+
+在为本仓库配置 CI 的过程中，跑出了两个**属于上游、不是本衍生版引入**的问题。一个已在本仓库订正，一个本仓库修不了（因为它在上游**已发布的 npm 产物**里）。
+
+### 8.1 已订正：`install-verify` 的 `npm ls` 诊断步必然杀整步
+
+`.github/workflows/install-verify.yml` 的 `Consumer clean install` 步最后一行
+`npm ls @deepseek-ai/dsh-llm @deepseek-ai/cordis` 检查的是**本就没装的 peer 包**，
+`npm ls` 对缺失包返回非零；而 GitHub 的 shell 带 `-e -o pipefail`，于是这条**预期为空**的
+诊断把整步报成 `##[error]Process completed with exit code 1`——而同一段日志里 npm 其实
+已经 `added 1 package, and audited 2 packages in 7s`。**6 条矩阵腿（3 平台 × 2 Node）全部**
+挂在这一行。上游已给同文件另一个诊断步加了 `continue-on-error: true`，唯独漏了这条。
+本仓库补了 `|| true`（与上游对其余诊断步的处置一致）。
+
+### 8.2 **未订正**：npm 包 `@furongjun1999/dsh-memory@0.8.1` 干净安装后无法 import
+
+`install-verify` 的 `ESM import check` 步**正确地报出了一个真实缺陷**（本仓库**不修改**这条检查
+——把它改成通过等于藏掉一个真缺陷）：
+
+```
+ESM FAIL: ERR_MODULE_NOT_FOUND
+Cannot find package '@deepseek-ai/schemastery'
+  imported from .../node_modules/@furongjun1999/dsh-memory/lib/index.js
+```
+
+**根因**：`@deepseek-ai/schemastery` 在 `package.json` 里被声明为
+`peerDependencies` + `peerDependenciesMeta: {optional: true}`，且 `dependencies` 为空；
+但入口 `src/index.ts` 对它做的是**静态顶层导入**（`import z from '@deepseek-ai/schemastery'`）。
+npm 7+ **不会**自动安装标记为 optional 的 peer 依赖 ⇒ 消费者执行干净的
+`npm install @furongjun1999/dsh-memory` 后，**任何** import 都会失败。
+
+**为什么本仓库修不了**：缺陷位于**上游已发布的 npm 产物**中。本仓库不发布 npm 包，
+改本仓库的 `package.json` 不会影响 registry 上那个 tarball。
+
+**给用户的绕过办法**（本仓库 README 的 FAQ 也写了）：
+
+```bash
+npm install @furongjun1999/dsh-memory @deepseek-ai/schemastery
+```
+
+**为什么值得单独记一笔**：这条检查属于上游自己的「issue #10 用户视角装机复现矩阵」——
+它设计出来就是为了抓这种事，而它**确实抓到了**。本仓库选择保留这条红灯并如实标注，
+而不是让它变绿。
+
+---
+
 _Last updated: 2026-10-13_

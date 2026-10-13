@@ -3,6 +3,20 @@ name: install-verify
 # 用户视角装机验证（issue #10 复现矩阵）：
 # 三平台 × 两 Node 版本，从 npm registry 干净安装 @furongjun1999/dsh-memory
 # 并验证 ESM 导入；另附「全局安装」诊断步（issue #10 最可能的错误安装方式）。
+#
+# ⚠️ 作用域（本衍生版补充说明，2026-10-13）：
+#   本工作流验证的是 **npm registry 上已发布的上游产物**，**不是本仓库的代码**——
+#   本衍生版不发布 npm 包。因此它的红/绿反映上游打包质量，本仓库无法从代码侧影响它。
+#   它只在 `workflow_dispatch` 或改动本文件时触发，**普通推送不会让它变红**。
+#
+#   当前状态（2026-10-13）：**已知红，且红得正确**。`ESM import check` 步报出上游
+#   `@furongjun1999/dsh-memory@0.8.1` 的一个真实用户级缺陷：
+#       ESM FAIL: ERR_MODULE_NOT_FOUND  Cannot find package '@deepseek-ai/schemastery'
+#         imported from .../node_modules/@furongjun1999/dsh-memory/lib/index.js
+#   根因：`@deepseek-ai/schemastery` 是 `optional: true` 的 peer 依赖（`dependencies` 为空），
+#   而入口 `src/index.ts:47` 对它做**静态顶层导入** ⇒ 干净安装后任何 import 都失败。
+#   **本仓库刻意不把这条检查改成通过**——那等于藏掉一个真缺陷。详见 NOTICE.md §8.2。
+#   用户绕过办法：npm install @furongjun1999/dsh-memory @deepseek-ai/schemastery
 on:
   workflow_dispatch:
   push:

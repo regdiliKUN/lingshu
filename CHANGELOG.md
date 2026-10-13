@@ -83,10 +83,28 @@
   诊断让整个 step 报 `##[error]Process completed with exit code 1` —— 而同一段日志里
   npm 其实已经 `added 1 package, and audited 2 packages in 7s`。6 条矩阵腿（3 平台 × 2 Node）
   **全部**挂在这一行。上游已给另一个诊断步加了 `continue-on-error: true`，唯独漏了这一条。
-  修法：补 `|| true`（与上游对该文件其余诊断步的处置一致）。
+  修法：补 `|| true`（与上游对该文件其余诊断步的处置一致）。订正后该步 6/6 通过。
   > 诚实标注：这是**上游工作流的遗留缺陷**，不是本衍生版引入的；本衍生版基线
   > `958097d` 原样带着它。因为该工作流只在 `workflow_dispatch` 或改它自身时触发，
   > 普通推送不会让它变红——但一个**不可能通过**的工作流留在仓库里是负债，故顺手订正。
+
+### 已知边界（上游缺陷 · 本衍生版无法修复）
+
+- **npm 包 `@furongjun1999/dsh-memory@0.8.1` 干净安装后无法 import**。`install-verify` 的
+  `ESM import check` 步报出：
+
+  ```
+  ESM FAIL: ERR_MODULE_NOT_FOUND  Cannot find package '@deepseek-ai/schemastery'
+    imported from .../node_modules/@furongjun1999/dsh-memory/lib/index.js
+  ```
+
+  根因：`@deepseek-ai/schemastery` 是 `optional: true` 的 peer 依赖（`dependencies` 为空），
+  而入口 `src/index.ts` 对它做**静态顶层导入** ⇒ npm 7+ 不自动装 optional peer
+  ⇒ 消费者干净安装后**任何** import 都失败。
+  **本仓库刻意不把这条检查改成通过**——那等于藏掉一个真缺陷。该缺陷位于**上游已发布的
+  npm 产物**中，本仓库不发布 npm 包，改本仓库 `package.json` 无法影响 registry 上的 tarball。
+  用户绕过办法：`npm install @furongjun1999/dsh-memory @deepseek-ai/schemastery`
+  （README 的 FAQ 已收录）。详见 `NOTICE.md` §8。
 
 ### 安全
 
