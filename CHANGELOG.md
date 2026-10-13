@@ -75,6 +75,19 @@
 - 验证：`python -m scripts.test_check_config_env_registry` → **通过 20 / 失败 0**，
   登记面 721 → 725，C1 缺口 4 → **0**；`md_cg.config_registry_guard` → **PASS 7 / FAIL 0**（含 G3 新鲜度）。
 
+### 修复（上游遗留 · 本衍生版顺带订正）
+
+- **`.github/workflows/install-verify.yml` 的 `npm ls` 诊断步永远杀整步**。该步最后一行
+  `npm ls @deepseek-ai/dsh-llm @deepseek-ai/cordis` 检查的是**本就没装的 peer 包**，
+  `npm ls` 对缺失包返回非零；而 GitHub 的 shell 带 `-e -o pipefail`，于是这条**预期为空**的
+  诊断让整个 step 报 `##[error]Process completed with exit code 1` —— 而同一段日志里
+  npm 其实已经 `added 1 package, and audited 2 packages in 7s`。6 条矩阵腿（3 平台 × 2 Node）
+  **全部**挂在这一行。上游已给另一个诊断步加了 `continue-on-error: true`，唯独漏了这一条。
+  修法：补 `|| true`（与上游对该文件其余诊断步的处置一致）。
+  > 诚实标注：这是**上游工作流的遗留缺陷**，不是本衍生版引入的；本衍生版基线
+  > `958097d` 原样带着它。因为该工作流只在 `workflow_dispatch` 或改它自身时触发，
+  > 普通推送不会让它变红——但一个**不可能通过**的工作流留在仓库里是负债，故顺手订正。
+
 ### 安全
 
 - **R5** 新增 `_trash_path(node_id)` 单点闸门（对应上游 issue #172）：`restore` / `_forget_apply` 的

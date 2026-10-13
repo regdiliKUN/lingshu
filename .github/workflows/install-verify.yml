@@ -29,7 +29,11 @@ jobs:
           npm init -y
           npm install @furongjun1999/dsh-memory
           echo "--- peer deps tree ---"
-          npm ls @deepseek-ai/dsh-llm @deepseek-ai/cordis 2>&1 | head -10
+          # peer 包本就没装 ⇒ `npm ls` 对缺失包返回非零；本步 shell 带 `-e -o pipefail`，
+          # 不加 `|| true` 会让这条**预期为空**的诊断杀掉整步（上游遗留缺陷，2026-10-13 实证：
+          # 6 条矩阵腿全挂在 `npm install` 之后、报 `##[error]Process completed with exit code 1`，
+          # 而 npm 侧其实已 `added 1 package`）。
+          npm ls @deepseek-ai/dsh-llm @deepseek-ai/cordis 2>&1 | head -10 || true
 
       - name: ESM import check
         shell: bash
