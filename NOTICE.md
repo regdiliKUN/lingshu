@@ -122,7 +122,7 @@
 
 在为本仓库配置 CI 与同步上游的过程中，跑出了**四个属于上游、不是本衍生版引入**的问题。
 两个已在本仓库订正，一个本仓库修不了（因为它在上游**已发布的 npm 产物**里），一个**刻意保留红灯**。
-**四个都已上报上游**，附可复现证据：
+**四个都已上报上游**，附可复现证据。`§8.5` 记录由 `§8.4` 直接推导出的分支保护配置决定：
 
 | # | 缺陷 | 本仓能否修 | 上游 issue |
 |---|---|---|---|
@@ -248,6 +248,32 @@ else if (process.env.npm_config_dry_run === 'true') {
 > 方法论：**关掉/绕过一条恒红的检查，与把它修好，是两件事。** 本仓选择第三条路——
 > **保留红灯 + 逐项根因 + 上报上游**，并明确标注「这条流水线当前不携带信号」。
 > 这比「把 3 项失败写成 `continue-on-error`」诚实，也比「默默不管」有用。
+
+**`opt.2` 推送后的 CI 实测（`39d69df1`，2026-10-13）**：
+
+| 工作流 | 结果 | 说明 |
+|---|---|---|
+| `cogmap-check` / `workspace-index-check` / `publish-artifact-check` / `conformance-check` / `hive-check` / `discipline-check` | ✅ 全绿 | 其中 `publish-artifact-check` **由红转绿**——正是 §8.3 那个 `prepare` 修复的直接效果（上游同项连续 7 次红） |
+| `python-tests` | ⚠️ 红 | `462/465 通过 · 7 跳过`，失败清单与**上游同 SHA 逐字一致** ⇒ 三项均为**继承**而非引入 |
+| `install-verify` | — | 本次未触发（path-filtered，推送未触及它的文件） |
+
+### 8.5 由此产生的配置决定：`main` 分支保护（2026-10-13 启用）
+
+| 项 | 值 | 理由 |
+|---|---|---|
+| `allow_force_pushes` | **false** | 防误 `--force` 改写已发布历史 |
+| `allow_deletions` | **false** | 防误删 `main` |
+| `enforce_admins` | **true** | 让上述两条**对管理员也生效**——否则保护对仓库所有者形同虚设（文档原文：默认「the restrictions of a branch protection rule don't apply to people with admin permissions」） |
+| `required_status_checks` | **未设置** | **刻意**：当前唯一「每次推送都跑」的检查 `run-tests` 是恒红的（§8.4），把它设为必需会让「满足条件」成为不可能 = **把门禁变成墙**。待上游修掉那 3 项后应补上 |
+| `required_pull_request_reviews` | 未设置 | 单人仓库，无需评审 |
+| `restrictions`（可推送人） | 未设置 | **不限制正常推送**——保护只拦 force-push 与删除，`git push` 正常工作 |
+
+> 若将来确需 force-push（例如改用 rebase 同步上游），临时在
+> `Settings → Branches → main → Edit` 里取消勾选即可，事后再勾回。
+> 另注：带 `paths` 过滤的工作流（`cogmap-check` / `workspace-index-check` /
+> `publish-artifact-check` / `install-verify`）**不能**作为必需检查——不触发时不会产生
+> check run，会让条件永久无法满足；且本仓多个工作流的 job 名同为 `check`，
+> 作为 context 存在歧义。这两点都是「必需检查」这个机制的实际约束，不是本仓的取舍。
 
 ---
 

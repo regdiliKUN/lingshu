@@ -547,6 +547,7 @@ lingshu/
   - **`install-verify`**：上游 registry 上 `@furongjun1999/dsh-memory@0.8.1` 的**已发布产物**缺陷（`optional: true` peer 被入口静态导入）⇒ 本仓不发布 npm 包、修不了，故保留红灯 + 明示 + 给绕过办法（见 [NOTICE.md §8.2](NOTICE.md)）。
   - **`python-tests`**（`opt.2` 起）：3 项失败，**全部继承自上游**——上游同 SHA `4169c5bd` 的 CI 是**同一份失败清单**（`462/465 通过 · 7 跳过`）。三项均为**恒红**：① `check_guard_coverage` 的 #179 反向判据把构建产物 `lib/index.js` 误判为「被点名脚本」；② `test_ecosystem_assembly` 硬编码 Windows 分隔符（被 #185 的递归收集首次暴露）；③ `test_issue211_export_target` 的 U10 断言 `aux` 是 Windows 保留设备名（POSIX 上不可能成立）。②③ 在本机 Windows 上**全绿**，可确认是平台可移植性而非逻辑缺陷。**已上报上游 [#234](https://github.com/FuRongJun-1999/dsh-memory/issues/234)**。
 - **诚实边界**：① 读数基于**合成 2000 节点库**，万级未实测；② 本机墙钟噪声 ±15~30%，故以**系统调用计数**为主证；③ 改动**未提交到上游**，本仓库以独立提交形式携带；④ 优化期间只跑了 `md_cg` 组套件、漏跑 `scripts` 组，这正是下一条缺陷溜过自检的原因——**选测试组要按「哪些守卫可能被改动触怒」，不是按「改了哪些文件」**；⑤ `opt.2` 起 `python-tests` 的红**不是本衍生版引入**，但它的存在意味着这条流水线**暂时不携带信号**（恒红），因此分支保护**未**把它设为必需检查。
+- **`main` 分支保护**（`opt.2` 起启用）：禁止 force-push、禁止删除、且**对管理员同样生效**（`enforce_admins`）。**正常 `git push` 不受影响**——保护只拦改写历史与删分支。**刻意不设必需状态检查**：唯一「每次推送都跑」的检查是恒红的 `run-tests`，把它设为必需会让条件永久无法满足（**把门禁变成墙**）。完整配置与理由见 [NOTICE.md §8.5](NOTICE.md)。
 
 ---
 
