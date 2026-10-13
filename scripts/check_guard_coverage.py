@@ -16,7 +16,8 @@
   1  存在**未登记的孤儿守卫**（既无执行面、又不在登记表）
   2  环境/解析错误（fail-closed：读不到 package.json / workflows / 收集面）
   3  登记表格式错误（缺理由或缺复核人）
-  4  gate/CI 点名的仓内脚本路径在磁盘上不存在（#179 反向判据）
+  4  gate/CI 点名的仓内脚本路径在磁盘上不存在（#179 反向判据；只认**命令面**
+     引用，保留带引号的路径，不把解释器内的提示文字当成脚本）
 
 用法：
   python -X utf8 scripts/check_guard_coverage.py                 # 人读覆盖矩阵
@@ -30,6 +31,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -190,21 +192,64 @@ def classify(guard: str, sf: dict) -> tuple[str, str]:
 # [issue-179 patch] 反向判据：被 gate/CI 点名的仓内脚本路径必须在磁盘上存在。
 # 解析保守：只收「含 >=1 个斜杠且以 .py/.js/.mjs/.cjs 结尾」的仓内相对 token；
 # 以 / . ~ 开头或含 .. 的形态一律不收（绝对路径 / 包路径 / 通配面都不瞎猜）。
+# 引号属于 shell 的词法，不能整段删除：python "scripts/x.py" 仍会执行 x.py。
 _NAMED_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_./~-])"
     r"([A-Za-z0-9_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)+\.(?:py|js|mjs|cjs))"
     r"(?![A-Za-z0-9_.-])"
 )
 
+# 生效条件：扫描本仓 npm scripts 与 workflow run 的静态 shell 命令；无法解析时抛 ValueError，由入口 fail-closed。
+def named_paths_in(text: str, _depth: int = 0) -> set:
+    """收集独立路径参数，保留 shell 引号；不执行命令。
 
-def named_paths_in(text: str) -> set:
-    """抽出一段文本里被点名的仓内脚本路径（去重）。"""
+    Node/Python 的 -e/-c 参数是程序源码，不是脚本文件名；不对这些源码做路径
+    子串匹配。shell -c 参数则继续按 shell 命令解析。echo/printf 的输出不计入。
+    这是静态路径检查，不分析动态路径、JS/Python 源码内的 import 或命令替换。
+    """
+    if _depth > 16:
+        raise ValueError("shell -c 嵌套过深，无法可靠解析执行面")
+    lex = shlex.shlex(text or "", posix=True, punctuation_chars=";&|()\n")
+    lex.whitespace = " \t\r"
+    lex.whitespace_split = True
+    words = list(lex)  # 引号未闭合时必须报解析错误，不能悄悄忽略后续脚本。
     out = set()
-    for m in _NAMED_PATH_RE.finditer(text or ""):
-        tok = m.group(1)
-        if ".." in tok:
+    command = ""
+    payload = ""
+    for word in words:
+        if payload:
+            if payload == "shell":
+                out.update(named_paths_in(word, _depth + 1))
+            payload = ""
             continue
-        out.add(tok)
+        if word and all(c in ";&|()\n" for c in word):
+            command = ""
+            continue
+        if not command:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", word) or word == "env":
+                continue
+            command = word.rsplit("/", 1)[-1]
+        if command in ("echo", "printf"):
+            continue
+        if command in ("node", "nodejs", "node.exe"):
+            if word in ("-e", "--eval", "-p", "--print"):
+                payload = "source"
+                continue
+            if word.startswith(("--eval=", "--print=", "-e", "-p")):
+                continue
+        if re.fullmatch(r"python(?:[23](?:\.\d+)?)?(?:\.exe)?", command):
+            if word == "-c":
+                payload = "source"
+                continue
+            if word.startswith("-c"):
+                continue
+        if command in ("sh", "bash", "dash", "zsh") and word in ("-c", "-lc", "-ec"):
+            payload = "shell"
+            continue
+        if _NAMED_PATH_RE.fullmatch(word) and ".." not in word:
+            out.add(word)
+    if payload:
+        raise ValueError("解释器内联选项缺少参数，无法解析执行面")
     return out
 
 
@@ -228,9 +273,16 @@ def _workflow_run_text(repo: str) -> str:
                 continue
             in_run = False
             if s.startswith("run:") or s.startswith("- run:"):
-                out.append(s)
+                value = s.split("run:", 1)[1].strip()
                 run_ind = ind
-                in_run = s.endswith("|") or s.endswith(">") or s.endswith("|-")
+                in_run = bool(re.fullmatch(r"[|>][-+]?", value))
+                if not in_run:
+                    # YAML 外层引号不是 shell 引号，先还原标量，再解析其命令。
+                    if value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1].replace("''", "'")
+                    elif value.startswith('"') and value.endswith('"'):
+                        value = json.loads(value)
+                    out.append(value)
     return "\n".join(out)
 
 
@@ -389,13 +441,36 @@ def selftest() -> int:
     except OSError:
         pass
 
+    # 4) #179 反向判据：只认命令面引用，不认字符串字面量里的同名路径。
+    #    正例 = gate 与 workflow 里的**裸路径**（缺失必须被抓）；
+    #    负例 = `node -e "…"` 载荷里报错文案提到的构建产物（本仓 prepare 的真实
+    #    形态，缺失必须**不**被抓——否则恒退 4）。
+    root2 = tempfile.mkdtemp(prefix="guardcov_named_")
+    os.makedirs(os.path.join(root2, "scripts"))
+    os.makedirs(os.path.join(root2, ".github", "workflows"))
+    open(os.path.join(root2, "scripts", "check_real.py"), "w",
+         encoding="utf-8").write("# x\n")
+    open(os.path.join(root2, "package.json"), "w", encoding="utf-8").write(
+        json.dumps({"scripts": {
+            "gate": "python scripts/check_real.py && python scripts/gone.py",
+            "prepare": "node -e \"console.error('构建产物 lib/gone.js 不存在')\"",
+        }}, ensure_ascii=False))
+    open(os.path.join(root2, ".github", "workflows", "w.yml"), "w",
+         encoding="utf-8").write("run: python scripts/also_gone.py\n")
+    miss = missing_named_paths(root2)
+    if miss != ["scripts/also_gone.py", "scripts/gone.py"]:
+        fails.append("点名缺失应为 [scripts/also_gone.py, scripts/gone.py]，实为 %r" % (miss,))
+    if "lib/gone.js" in miss:
+        fails.append("字符串字面量里的路径被误判为点名缺失（#179 误报形态）：lib/gone.js")
+
     for f in fails:
         print("  [FAIL] " + f)
     print("")
     if fails:
         print("  自检：%d 项失败" % len(fails))
         return 1
-    print("  自检：全部通过（判据有判别力：覆盖/配对测试/孤儿/登记/ fail-closed 五面）")
+    print("  自检：全部通过（判据有判别力：覆盖/配对测试/孤儿/登记/ fail-closed /"
+          " 命令面点名 六面）")
     return 0
 
 

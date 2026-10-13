@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """第七阶段: 7 终极目标 × 7 初级复现 生态盘点 + 跨域组装验证"""
 import sys
-import os, io, re
+import os, ast
 sys.stdout.reconfigure(encoding='utf-8')
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
@@ -23,24 +23,38 @@ print('=' * 60)
 print('第七阶段 · 7 终极目标 × 7 初级复现 生态盘点')
 print('=' * 60)
 total = 0
+source_ids = {}
 for name, fn in MODS:
-    src = io.open(f'{TOOLS}\\{fn}', encoding='utf-8').read()
-    # 精确匹配单元 dict 键: 行首 4 空格 + "域-名(可含空格)": {
-    uids = re.findall(r'^    "([^"]+)":\s*\{', src, re.M)
+    # 路径必须用 os.path.join 拼：原写法 f'{TOOLS}\\{fn}' 把反斜杠当分隔符写死，
+    # POSIX 上会拼出一个**含 '\' 的单个文件名**，open 必 ENOENT。该写法此前从未
+    # 暴露，是因为 issue #185 把 md_cg 收集面从非递归改成递归后，本件（住在
+    # whitebox_kb/wisdom/ 子目录）才第一次进入 run_tests.py 的收集面。
+    with open(os.path.join(TOOLS, fn), encoding='utf-8') as fh:
+        src = fh.read()
+    # 生效条件：静态盘点各域顶层 *_UNITS 字典；语法树不依赖缩进或单双引号。
+    dictionaries = [stmt.value for stmt in ast.parse(src).body
+                    if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Dict)
+                    and any(isinstance(t, ast.Name) and t.id.endswith('_UNITS')
+                            for t in stmt.targets)]
+    assert len(dictionaries) == 1, f'{fn}: 必须有唯一的单元字典'
+    keys = dictionaries[0].keys
+    assert all(isinstance(k, ast.Constant) and isinstance(k.value, str) for k in keys), fn
+    uids = [k.value for k in keys]
+    assert len(set(uids)) == len(uids), f'{fn}: 存在重复单元名'
+    source_ids[name] = set(uids)
     total += len(uids)
     print(f'  {TARGET[name]:14s} {name:9s} {len(uids):3d} 单元')
 print('-' * 60)
 print(f'  六域合计: {total} 单元')
 
-# 核对：正则盘点 vs code_compose 正式注册表（防正则漏匹配——含空格 uid 如
-# "异步-async await" / "并行-Service Worker" 曾被 \S+ 漏掉）
+# 核对每一域的名称集合；数目相等但漏登记或错登记同样必须失败。
 sys.path.insert(0, TOOLS)
 from code_compose import DOMAIN_UNITS
 reg_total = sum(len(DOMAIN_UNITS[n]) for n, _ in MODS)
-if total == reg_total:
-    print(f'  注册表核对: 正则 {total} == DOMAIN_UNITS {reg_total} ✔')
-else:
-    print(f'  注册表核对: 正则 {total} != DOMAIN_UNITS {reg_total} ✘（正则漏匹配）')
+for name, _ in MODS:
+    assert source_ids[name] == set(DOMAIN_UNITS[name]), f'{name}: 源码单元与注册表不一致'
+assert total == reg_total, f'源码 {total} != DOMAIN_UNITS {reg_total}'
+print(f'  注册表核对: AST {total} == DOMAIN_UNITS {reg_total} ✔（逐域名称一致）')
 
 # ============ 跨域组装验证 ============
 print()
@@ -50,6 +64,7 @@ print('           → 操作系统内存(os) → 浏览器绘制(browser)')
 print('=' * 60)
 from code_compose import domain_route
 
+# 生效条件：跨域组装需要执行 domain_route 生成的代码，并验证生成结果可用。
 def get(uid, q):
     r = domain_route(q)
     assert r.get('ok') and r.get('code'), f'{uid} 生成失败: {r}'

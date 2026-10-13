@@ -147,17 +147,40 @@ def _run():
     _check("U9 库根顶层普通文件放行",
            _raised(security.check_export_target,
                    os.path.join(lib, "export_1.jsonl"), lib, "t")[0] is False)
-    # aux 根误配（末段是 Windows 保留设备名）时 datapath.aux_root() 抛
-    # ValueError；落点无法校验 ⇒ 必须 fail-closed，且理由要能看懂。
+    # U10 辅助存储根解析失败 ⇒ 必须 fail-closed（PermissionError 而非裸 ValueError），
+    # 且理由要能看懂。
+    #
+    # 被测件是 security.check_export_target 的 **fail-closed 契约**（平台无关）；
+    # 分平台的只是**触发面**：
+    #   · Windows：MDCG_AUX_ROOT 末段是保留设备名（aux/con/prn/nul…）⇒ datapath 的
+    #     #57 守卫在 _abs_host_path 直判抛 ValueError（真实误配；口径见
+    #     md_cg/test_datapath_device_name.py 的 §1/§4）。
+    #   · POSIX：保留设备名不是概念，同一形态是**合法目录名**，datapath 有意不判定
+    #     ⇒ 该误配构造不出来。旧写法在此断言一个不可能成立的行为，Linux CI 上恒红；
+    #     现改为**直接注入** aux_root 抛 ValueError，让同一条契约在两个平台都真的被
+    #     跑到（原写法在 Linux 上等于这条分支从未被执行）。
+    _real_aux_root = datapath.aux_root
     _old_aux = os.environ.get("MDCG_AUX_ROOT")
-    os.environ["MDCG_AUX_ROOT"] = os.path.join(_SANDBOX, "aux")
     try:
+        if os.name == "nt":
+            os.environ["MDCG_AUX_ROOT"] = os.path.join(_SANDBOX, "aux")
+            _trigger = "env MDCG_AUX_ROOT 末段 aux（真实误配）"
+        else:
+            # 生效条件：POSIX 上验证辅助根解析失败时的导出 fail-closed 契约。
+            def _aux_root_unresolvable():
+                raise ValueError(
+                    "MDCG_AUX_ROOT 归一后末段是 Windows 保留设备名（'…/aux'）："
+                    "POSIX 不判定该形态，本项按注入触发（等价于 Windows 上的真实误配）")
+
+            datapath.aux_root = _aux_root_unresolvable
+            _trigger = "注入 aux_root() 抛 ValueError（POSIX 构造不出真实误配）"
         hit, kind, txt10 = _raised(security.check_export_target,
                                    os.path.join(lib, "export_2.jsonl"), lib, "t")
-        _check("U10 aux 根无法解析 ⇒ fail-closed（PermissionError 而非裸 ValueError）",
+        _check("U10 辅助存储根无法解析 ⇒ fail-closed（PermissionError 而非裸 ValueError）",
                hit and kind == "PermissionError" and "辅助存储根无法解析" in txt10,
-               repr((hit, kind, txt10[:90])))
+               repr((_trigger, hit, kind, txt10[:90])))
     finally:
+        datapath.aux_root = _real_aux_root
         if _old_aux is None:
             os.environ.pop("MDCG_AUX_ROOT", None)
         else:
